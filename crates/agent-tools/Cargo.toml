@@ -1,0 +1,35 @@
+[package]
+name = "agent-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pluggable WorkspaceBackend (Local, Docker, RemoteSandbox), SSRF-safe web & skills primitives, and unified sandbox-side programmatic Code Mode SDK/runner"
+keywords = ["agent", "sandbox", "tools", "json-rpc", "code-mode"]
+categories = ["development-tools", "api-bindings"]
+
+[[bin]]
+name = "agent-code-mode"
+path = "src/bin/agent_code_mode.rs"
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+futures.workspace = true
+globset.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ureq.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

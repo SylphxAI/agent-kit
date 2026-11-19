@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent-memory",
+    "crates/agent-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/SylphxAI/agent-kit"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.23"
+flate2 = "1"
+futures = "0.3"
+globset = "0.4"
+libc = "0.2"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "api-31"] }
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+thiserror = "2"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util"] }
+ureq = { version = "3", features = ["json"] }
+uuid = { version = "1", features = ["v7"] }
+
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.test.package.sha2]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.test.package.flate2]
+opt-level = 3

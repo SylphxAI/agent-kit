@@ -1,0 +1,49 @@
+[package]
+name = "agent-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust Raw-RAG memory engine: immutable raw history, BM25 + dense retrieval, reciprocal rank fusion, cross-encoder reranking, exact raw-byte citations, and pluggable SQLite/Postgres+pgvector backends"
+keywords = ["agent", "memory", "rag", "bm25", "pgvector"]
+categories = ["database", "text-processing"]
+
+[features]
+default = ["sqlite"]
+# SQLite/FTS5 lexical index, int8 quantized dense index, and SqliteStore backend.
+sqlite = ["dep:rusqlite"]
+# PostgreSQL + pgvector backend (PostgresPgvectorStore).
+postgres = ["dep:sqlx", "dep:tokio"]
+# Standalone retrieval service: local ONNX inference, remote OpenAI/Cohere/Voyage/Jina
+# embedding and reranking providers, background dense indexing, and offline evaluation.
+service = ["sqlite", "dep:ort", "dep:tokenizers", "dep:flate2", "dep:tar", "dep:ureq"]
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+rusqlite = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+flate2 = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }
+
+[[example]]
+name = "memory-eval"
+required-features = ["service"]
