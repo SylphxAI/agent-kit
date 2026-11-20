@@ -186,58 +186,103 @@ pub struct CitedRange {
     pub sha256: String,
 }
 
-/// Hybrid ASCII + CJK tokenizer: emits lowercased alphanumeric/identifier tokens
-/// (`len >= 2`, plus sub-tokens split on `_` and `-`) together with individual CJK
-/// characters and CJK bigrams so English, code identifiers, and CJK queries
-/// achieve high BM25 recall without external stemmers.
+/// Document-side tokenizer: emits lowercased alphanumeric/identifier tokens
+/// (`len >= 2`, plus sub-tokens split on `_` and `-`), and both CJK unigrams and
+/// overlapping bigrams. This supports single-character recall and compound phrases.
 pub fn tokenize_hybrid_search_tokens(text: &str) -> Vec<String> {
+    scan_tokens(
+        text,
+        is_cjk,
+        |token| token,
+        |run, out| {
+            out.extend(run.iter().map(|ch| ch.to_string()));
+            out.extend(cjk_bigrams(run));
+        },
+    )
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SearchTerm {
+    Token(String),
+    CjkPhrase(Vec<String>),
+}
+
+/// A multi-character CJK run matches only its ordered, adjacent bigrams. A
+/// phrase of unigrams could match separately delimited characters in the
+/// existing index; OR-ing bigrams could match only part of a longer compound.
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+pub(crate) fn tokenize_search_terms(text: &str) -> Vec<SearchTerm> {
+    scan_tokens(
+        text,
+        // The indexed script ranges also contain punctuation such as ？ and ・.
+        // Treat it as a query boundary without changing existing index tokens.
+        |ch| is_cjk(ch) && ch.is_alphanumeric(),
+        SearchTerm::Token,
+        |run, out| {
+            out.push(match run {
+                [ch] => SearchTerm::Token(ch.to_string()),
+                run => SearchTerm::CjkPhrase(cjk_bigrams(run).collect()),
+            });
+        },
+    )
+}
+
+fn scan_tokens<T>(
+    text: &str,
+    cjk_char: impl Fn(char) -> bool,
+    ascii_term: impl Fn(String) -> T,
+    cjk_terms: impl Fn(&[char], &mut Vec<T>),
+) -> Vec<T> {
     let mut tokens = Vec::new();
     let mut ascii_buf = String::new();
-    let mut cjk_run: Vec<char> = Vec::new();
-
-    let flush_ascii = |buf: &mut String, out: &mut Vec<String>| {
-        let trimmed = buf.trim_matches(['-', '_']);
-        if trimmed.len() >= 2 {
-            let lower = trimmed.to_ascii_lowercase();
-            out.push(lower.clone());
-            if lower.contains('_') || lower.contains('-') {
-                for part in lower.split(['_', '-']) {
-                    if part.len() >= 2 {
-                        out.push(part.to_string());
-                    }
-                }
-            }
+    let mut cjk_run = Vec::new();
+    let flush_cjk = |run: &mut Vec<char>, out: &mut Vec<T>| {
+        if !run.is_empty() {
+            cjk_terms(run, out);
+            run.clear();
         }
-        buf.clear();
     };
-    let flush_cjk = |run: &mut Vec<char>, out: &mut Vec<String>| {
-        for &ch in run.iter() {
-            out.push(ch.to_string());
-        }
-        for pair in run.windows(2) {
-            let mut s = String::with_capacity(6);
-            s.push(pair[0]);
-            s.push(pair[1]);
-            out.push(s);
-        }
-        run.clear();
-    };
-
     for ch in text.chars() {
-        if is_cjk(ch) {
-            flush_ascii(&mut ascii_buf, &mut tokens);
+        if cjk_char(ch) {
+            flush_ascii_tokens(&mut ascii_buf, &mut tokens, &ascii_term);
             cjk_run.push(ch);
         } else if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
             flush_cjk(&mut cjk_run, &mut tokens);
             ascii_buf.push(ch);
         } else {
-            flush_ascii(&mut ascii_buf, &mut tokens);
+            flush_ascii_tokens(&mut ascii_buf, &mut tokens, &ascii_term);
             flush_cjk(&mut cjk_run, &mut tokens);
         }
     }
-    flush_ascii(&mut ascii_buf, &mut tokens);
+    flush_ascii_tokens(&mut ascii_buf, &mut tokens, &ascii_term);
     flush_cjk(&mut cjk_run, &mut tokens);
     tokens
+}
+
+fn flush_ascii_tokens<T>(buf: &mut String, out: &mut Vec<T>, term: &impl Fn(String) -> T) {
+    let trimmed = buf.trim_matches(['-', '_']);
+    if trimmed.len() >= 2 {
+        let lower = trimmed.to_ascii_lowercase();
+        out.push(term(lower.clone()));
+        if lower.contains('_') || lower.contains('-') {
+            for part in lower.split(['_', '-']) {
+                if part.len() >= 2 {
+                    out.push(term(part.to_string()));
+                }
+            }
+        }
+    }
+    buf.clear();
+}
+
+fn cjk_bigrams(run: &[char]) -> impl Iterator<Item = String> + '_ {
+    run.windows(2).map(|pair| {
+        let mut s = String::with_capacity(6);
+        s.push(pair[0]);
+        s.push(pair[1]);
+        s
+    })
 }
 
 #[cfg(test)]
@@ -245,16 +290,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hybrid_tokenizer_splits_identifiers_and_emits_cjk_bigrams() {
-        let tokens = tokenize_hybrid_search_tokens("deploy_staging-v2 部署失敗!");
-        assert!(tokens.contains(&"deploy_staging-v2".to_string()));
-        assert!(tokens.contains(&"deploy".to_string()));
-        assert!(tokens.contains(&"staging".to_string()));
-        assert!(tokens.contains(&"v2".to_string()));
-        assert!(tokens.contains(&"部".to_string()));
-        assert!(tokens.contains(&"部署".to_string()));
-        assert!(tokens.contains(&"署失".to_string()));
-        assert!(tokens.contains(&"失敗".to_string()));
+    fn document_tokens_keep_existing_index_layout_and_boundaries() {
+        assert_eq!(
+            tokenize_hybrid_search_tokens("__Deploy_Staging-v2-部署失敗、頭"),
+            [
+                "deploy_staging-v2",
+                "deploy",
+                "staging",
+                "v2",
+                "部",
+                "署",
+                "失",
+                "敗",
+                "部署",
+                "署失",
+                "失敗",
+                "頭",
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_character_query_runs_are_ordered_bigram_phrases() {
+        use SearchTerm::CjkPhrase;
+        assert_eq!(
+            tokenize_search_terms("頭像"),
+            [CjkPhrase(vec!["頭像".into()])]
+        );
+        assert_eq!(
+            tokenize_search_terms("由頭跟到尾"),
+            [CjkPhrase(
+                ["由頭", "頭跟", "跟到", "到尾"].map(String::from).to_vec()
+            )]
+        );
+    }
+
+    #[test]
+    fn query_keeps_ascii_terms_and_standalone_cjk_at_run_boundaries() {
+        use SearchTerm::{CjkPhrase, Token};
+        assert_eq!(
+            tokenize_search_terms("頭像圖Deploy_Staging-v2、頭 help！"),
+            [
+                CjkPhrase(vec!["頭像".into(), "像圖".into()]),
+                Token("deploy_staging-v2".into()),
+                Token("deploy".into()),
+                Token("staging".into()),
+                Token("v2".into()),
+                Token("頭".into()),
+                Token("help".into()),
+            ]
+        );
+        assert!(tokenize_search_terms("a - !").is_empty());
     }
 
     #[test]

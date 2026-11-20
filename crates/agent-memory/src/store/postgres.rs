@@ -18,7 +18,10 @@ use crate::{
         StoreError, StoreStats,
     },
     text::readable,
-    tokenize::{HistorySort, IndexMetadata, MemoryScope, tokenize_hybrid_search_tokens},
+    tokenize::{
+        HistorySort, IndexMetadata, MemoryScope, SearchTerm, tokenize_hybrid_search_tokens,
+        tokenize_search_terms,
+    },
 };
 
 /// Idempotent PostgreSQL + `pgvector` schema migration SQL for [`PostgresPgvectorStore`].
@@ -160,35 +163,33 @@ pub fn parse_pgvector(literal: &str) -> Result<Vec<f32>, StoreError> {
     Ok(out)
 }
 
-/// Convert raw query strings into an OR-combined PostgreSQL `to_tsquery('simple', ...)` expression
-/// using the hybrid ASCII + CJK tokenizer.
+/// Convert raw query strings into an OR-combined PostgreSQL tsquery, preserving
+/// adjacency within each multi-character CJK term.
 pub fn build_tsquery_expression(
     query: &Option<String>,
     extra_queries: &[String],
 ) -> Option<String> {
-    let mut tokens: Vec<String> = query
+    fn quote_lexeme(token: &str) -> String {
+        format!("'{}'", token.replace('\\', "\\\\").replace('\'', "''"))
+    }
+
+    let mut terms: Vec<String> = query
         .iter()
         .chain(extra_queries.iter())
-        .flat_map(|q| tokenize_hybrid_search_tokens(q))
-        .map(|t| {
-            t.chars()
-                .filter(|c| !matches!(c, '\'' | '&' | '|' | '!' | '(' | ')' | ':' | '*' | '\\'))
-                .collect::<String>()
+        .flat_map(|q| tokenize_search_terms(q))
+        .map(|term| match term {
+            SearchTerm::Token(token) => quote_lexeme(&token),
+            SearchTerm::CjkPhrase(bigrams) => bigrams
+                .iter()
+                .map(|token| quote_lexeme(token))
+                .collect::<Vec<_>>()
+                .join(" <-> "),
         })
-        .filter(|t| !t.is_empty())
         .collect();
-    tokens.sort();
-    tokens.dedup();
-    if tokens.is_empty() {
-        return None;
-    }
-    Some(
-        tokens
-            .into_iter()
-            .map(|t| format!("'{t}'"))
-            .collect::<Vec<_>>()
-            .join(" | "),
-    )
+    // <-> binds more tightly than |, so the phrase is one OR alternative.
+    terms.sort_unstable();
+    terms.dedup();
+    (!terms.is_empty()).then(|| terms.join(" | "))
 }
 
 /// Build the normalized lexical search text indexed into `memory_records.search_text`.
@@ -1062,14 +1063,15 @@ mod tests {
 
     #[test]
     fn tsquery_builder_sanitizes_operators_and_preserves_cjk_bigrams() {
-        let expr = build_tsquery_expression(&Some("foo'bar & baz | 部署!".into()), &[]).unwrap();
-        assert!(expr.contains("'foo'"));
-        assert!(expr.contains("'bar'"));
-        assert!(expr.contains("'baz'"));
-        assert!(expr.contains("'部署'"));
-        assert!(!expr.contains("foo'bar"));
-        assert!(!expr.contains('&'));
-        assert!(!expr.contains('!'));
+        let expr = build_tsquery_expression(
+            &Some("foo'bar & baz | 部署！頭像圖Deploy".into()),
+            &["頭像圖 頭".into()],
+        );
+        assert_eq!(
+            expr.as_deref(),
+            Some("'bar' | 'baz' | 'deploy' | 'foo' | '部署' | '頭' | '頭像' <-> '像圖'")
+        );
+        assert_eq!(build_tsquery_expression(&None, &["' | !".into()]), None);
     }
 
     /// Live PostgreSQL + pgvector end-to-end integration test.
