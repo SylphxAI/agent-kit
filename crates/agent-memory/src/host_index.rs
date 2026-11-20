@@ -15,8 +15,8 @@ use std::{
 use crate::{
     raw::{RawCoordinate, RawSource, read_raw, sha256_hex},
     tokenize::{
-        HistorySearchQuery, HistorySort, IndexHit, IndexMetadata, MemoryScope,
-        tokenize_hybrid_search_tokens,
+        HistorySearchQuery, HistorySort, IndexHit, IndexMetadata, MemoryScope, SearchTerm,
+        tokenize_hybrid_search_tokens, tokenize_search_terms,
     },
 };
 
@@ -449,11 +449,11 @@ impl HostIndex {
             ));
             values.extend(ids.iter().cloned().map(Value::Text));
         }
-        let terms: Vec<String> = query
+        let terms: Vec<SearchTerm> = query
             .query
             .iter()
             .chain(query.queries.iter())
-            .flat_map(|s| tokenize_hybrid_search_tokens(s))
+            .flat_map(|s| tokenize_search_terms(s))
             .collect();
         let lexical = !terms.is_empty();
         if let Some(segment) = segment {
@@ -530,7 +530,13 @@ impl HostIndex {
             values.push(
                 terms
                     .into_iter()
-                    .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+                    .map(|term| {
+                        let phrase = match term {
+                            SearchTerm::Token(token) => token,
+                            SearchTerm::CjkPhrase(bigrams) => bigrams.join(" "),
+                        };
+                        format!("\"{}\"", phrase.replace('"', "\"\""))
+                    })
                     .collect::<Vec<_>>()
                     .join(" OR ")
                     .into(),
@@ -853,6 +859,85 @@ fn prepare_document(
 mod tests {
     use super::*;
     use crate::raw::RawSegment;
+
+    #[test]
+    fn fts5_compound_cjk_queries_rank_exact_hits_and_reject_partial_matches() {
+        let dir = crate::test_tempdir();
+        let seg = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let avatar = "agent-avatar-style-standard";
+        for (id, content, timestamp_ms) in [
+            (avatar, "頭像圖 頭像", 10),
+            ("other-avatar", "今日頭像更新完成", 20),
+            ("single", "由頭跟到尾", 30),
+            ("reversed", "像頭", 40),
+            ("separated", "頭、像", 50),
+            ("separated-pairs", "頭像、像圖", 60),
+            ("ascii", "deploy the staging app", 70),
+        ] {
+            let raw = seg.append(content.as_bytes()).unwrap();
+            index
+                .index(
+                    id,
+                    &IndexMetadata {
+                        agent_id: "agt_1".into(),
+                        source: MemoryScope::Memory,
+                        timestamp_ms: Some(timestamp_ms),
+                        direction: "out".into(),
+                        sender: "agt_1".into(),
+                        destination: "agt_1".into(),
+                        tool_name: None,
+                        tool_names: Vec::new(),
+                        role: None,
+                    },
+                    &raw,
+                )
+                .unwrap();
+        }
+
+        let owners = ["agt_1".to_string()];
+        let ids = |query: &str, variants: &[&str]| -> Vec<String> {
+            index
+                .search(
+                    &owners,
+                    MemoryScope::Memory,
+                    &HistorySearchQuery {
+                        query: Some(query.into()),
+                        queries: variants.iter().map(|s| (*s).into()).collect(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect()
+        };
+
+        assert_eq!(
+            ids("頭像", &[]),
+            [avatar, "separated-pairs", "other-avatar"]
+        );
+        assert_eq!(ids("頭像圖？", &[]), [avatar]);
+        assert_eq!(ids("deploy", &[]), ["ascii"]);
+        let mut single = ids("頭", &[]);
+        single.sort();
+        assert_eq!(
+            single,
+            [
+                avatar,
+                "other-avatar",
+                "reversed",
+                "separated",
+                "separated-pairs",
+                "single"
+            ]
+        );
+        for (query, variants) in [("頭像圖Deploy", &[][..]), ("DEPLOY", &["頭像圖"][..])] {
+            let mut hits = ids(query, variants);
+            hits.sort();
+            assert_eq!(hits, [avatar, "ascii"]);
+        }
+    }
 
     #[test]
     fn fts5_bm25_enforces_owner_acl_cjk_search_and_window_citations() {
