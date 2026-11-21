@@ -29,6 +29,20 @@ Pluggable workspace backends, SSRF-safe web utilities, skill discovery, and a un
   - Extensible `NamespaceHandler` trait and `ToolRegistry` supporting standard namespaces (`workspace`, `web`, `memory`, `workstation`) plus arbitrary caller-mounted namespaces with zero orchestrator hardcoding.
   - Enforced timeouts (with Unix process-group termination), call budgets, fail-closed unknown namespace/method checks, and UTF-8-safe output truncation.
 
+### 3. `agent-ingress`
+
+Default-open ingress blocklist and structured sender awareness, with no model or network calls:
+- **`SenderIdentity`** carries channel, sender, chat, and host-resolved relationship. `format_awareness_header()` puts the relationship in a single structured line without user-editable display fields.
+- **`evaluate_ingress`** checks exact channel/sender or channel/chat matches, ignoring expired rules. Owner, admin, parent, and peer always pass, even when a stored rule matches. `validate_block_target` rejects those relationships at write time too.
+- **`IngressBlockStore`** is an async storage port with an in-memory reference implementation. Call `is_blocked` before queueing the event or waking the agent. A storage error is not an `Allow`.
+- **`IngressGuardToolRequest` / `IngressGuardToolResponse`** define the JSON wire contract for `block_sender`, `unblock_sender`, and `list_blocks`. For example:
+
+  ```json
+  {"op":"block_sender","target":{"channel":"example","scope":{"kind":"chat","chat_id":"chat-1"}}}
+  ```
+
+Authenticate the inbound event and derive the relationship independently of the message body. Scope the store to the receiving agent and authorized channel accounts. For writes, resolve the exact target in that scope and pass its current relationship and host-generated audit fields via `BlockWriteContext`; do not infer authority from a tool argument or the awareness header. For allowed messages, put the header in host-controlled context separate from the body. A `LeaveChat` hint for a group is advisory: independently authorize the effect and ensure it cannot cut off protected senders.
+
 ## Quick Verification
 
 ```bash
