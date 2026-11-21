@@ -43,6 +43,21 @@ Default-open ingress blocklist and structured sender awareness, with no model or
 
 Authenticate the inbound event and derive the relationship independently of the message body. Scope the store to the receiving agent and authorized channel accounts. For writes, resolve the exact target in that scope and pass its current relationship and host-generated audit fields via `BlockWriteContext`; do not infer authority from a tool argument or the awareness header. For allowed messages, put the header in host-controlled context separate from the body. A `LeaveChat` hint for a group is advisory: independently authorize the effect and ensure it cannot cut off protected senders.
 
+### 4. `agent-channels`
+
+Channel primitives with no network, storage, or model calls. Only `serde` and `serde_json` are dependencies:
+
+- **`telegram`**: `TelegramInboundMeta::from_message` turns a Bot API `Message` into `chat_id`, `chat_type`, `thread_id`, `message_id`, `sender_id`, `sender_is_bot`, `addressed` and `context_only`.
+  - `forum_thread_id` returns a positive `message_thread_id` only when `is_topic_message` is true. A reply chain in a plain supergroup, or in a forum's General topic, gets no thread.
+  - `is_addressed_to_bot` is true for private chats, `@mention` / `text_mention`, `/cmd` or `/cmd@bot`, and replies to the bot.
+  - An unaddressed group message is `context_only`.
+- **`reply_target`**: `ReplyTarget` can only be built through validating constructors, so a Telegram target never has a zero, negative or non-numeric thread or a compound chat id.
+  - `resolve_reply_target(metadata, session_key)` accepts `replyThreadId` and `messageThreadId` (and their snake_case forms), as strings or integers. A placeholder in one field never hides a valid id in the next.
+  - It decomposes compound targets (`-1001:topic:54007`, `telegram:chat:-1001:54007`) and falls back to a `:topic:<id>` / `:thread:<id>` session key for the same chat.
+  - `telegram_send_message_payload` and `apply_telegram_message_thread_id` attach `message_thread_id` only when it is positive.
+- **`speech_gate`**: `decide_terminal_text_delivery` decides whether an agent's terminal text may be posted to a channel. It fails closed: `OutboundSpeechMode::ToolOnly`, a context-only turn, a message already sent through a tool, or a silence sentinel each suppress delivery.
+  - `is_suppressed_terminal_sentinel` covers empty text, plus `NO_REPLY` or `completed` with any case, punctuation or Markdown. Text whose first line is `NO_REPLY` is also suppressed.
+
 ## Quick Verification
 
 ```bash
