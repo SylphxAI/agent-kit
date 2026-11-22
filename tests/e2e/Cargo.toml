@@ -1,0 +1,21 @@
+[package]
+name = "agent-kit-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[test]]
+name = "inbound_to_reply"
+path = "tests/inbound_to_reply.rs"
+
+[dev-dependencies]
+agent-channels = { path = "../../crates/agent-channels" }
+agent-ingress = { path = "../../crates/agent-ingress" }
+agent-memory = { path = "../../crates/agent-memory", default-features = false, features = ["sqlite"] }
+agent-tools = { path = "../../crates/agent-tools" }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

@@ -5,15 +5,33 @@
 //! and optional cross-encoder reranking, returning verified exact raw-byte citations
 //! authenticated by SHA-256 digests.
 //!
-//! ## Backends & Feature Flags
-//! - `sqlite` (default): local [`store::SqliteStore`], [`host_index::HostIndex`] (FTS5 BM25),
-//!   and [`dense::DenseIndex`] (per-vector int8 quantized cosine search).
-//! - `postgres`: production [`store::PostgresPgvectorStore`] using PostgreSQL `tsvector` +
-//!   `pgvector` cosine similarity + SQL CTE reciprocal rank fusion and exact byte-slice
-//!   citation readback.
-//! - `service`: local ONNX Runtime inference (`runtime`, `model`, `pins`), remote OpenAI /
-//!   Cohere / Voyage / Jina providers (`providers`), striped background dense indexing
-//!   (`embed`, `service`), and offline retrieval benchmarking (`eval`).
+//! Memory is event history and learned notes, not a curated Knowledge catalog.
+//! Keep recalled material separate from the Instructions governing an agent.
+//!
+//! ## Backends and features
+//!
+//! - `sqlite` (default): local `SqliteStore` with FTS5 BM25 and int8-quantized dense search.
+//! - `postgres`: `PostgresPgvectorStore` with PostgreSQL `tsvector`, `pgvector` cosine
+//!   similarity, SQL reciprocal rank fusion, and exact byte-slice citation readback.
+//! - `service`: local ONNX Runtime inference, remote embedding and reranking
+//!   providers, background dense indexing, and offline retrieval benchmarking.
+//!
+//! ## Append and read exact bytes without a database
+//!
+//! ```
+//! use agent_memory::{RawSegment, read_raw};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let dir = tempfile::tempdir()?;
+//! let segment = RawSegment::open(&dir.path().join("events.raw"))?;
+//! let event = br#"{ "text": "garden archive" }"#;
+//! let citation = segment.append(event)?;
+//! assert_eq!(citation.length, event.len() as u64);
+//! // Reads the exact bytes at the coordinate and verifies its SHA-256 digest.
+//! assert_eq!(read_raw(&citation)?, event);
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod fusion;
 pub mod notes;

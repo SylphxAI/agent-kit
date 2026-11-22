@@ -38,6 +38,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+      - name: OSS source purity
+        run: python3 scripts/check-oss-purity.py
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy, rustfmt
@@ -49,7 +51,9 @@ jobs:
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --all-features --locked
+        run: |
+          cargo doc --workspace --no-deps --locked
+          cargo doc --workspace --no-deps --all-features --locked
 
   test:
     if: github.event.repository.private == false
@@ -63,6 +67,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Test workspace (all features)
         run: cargo test --workspace --all-features --locked
+      - name: Run doctests (default features)
+        run: cargo test --doc --workspace --locked
       - name: Check default features and individual memory backends
         run: |
           cargo check --workspace --locked

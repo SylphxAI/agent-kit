@@ -3,8 +3,38 @@
 //! SSRF-safe web utilities, skill discovery, and a unified sandbox-side
 //! Programmatic Code Mode SDK and runner ([`code_mode`]).
 //!
-//! All workspace operations route strictly through [`WorkspaceBackend`], ensuring
-//! remote and containerized sandboxes never touch the coordinator host filesystem.
+//! [`WorkspaceBackend`] routes command and file operations to the selected
+//! backend. A remote backend does not fall back to the coordinator's local workspace.
+//!
+//! [`skills`] discovers Skills packaged as `SKILL.md` files without executing
+//! them. The host decides which Skills to load and which Instructions to trust.
+//! The host also mounts each namespace explicitly; use an OS or container sandbox
+//! when executing untrusted code, not a local workspace as an isolation boundary.
+//!
+//! ## Dispatch a mounted workspace call
+//!
+//! ```
+//! use std::sync::Arc;
+//! use agent_tools::LocalWorkspace;
+//! use agent_tools::code_mode::{ToolCallRequest, ToolRegistry};
+//! use serde_json::json;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let dir = tempfile::tempdir()?;
+//! std::fs::write(dir.path().join("note.txt"), "garden archive")?;
+//! let dispatcher = ToolRegistry::new()
+//!     .with_workspace(Arc::new(LocalWorkspace::new(dir.path().to_owned())))
+//!     .into_dispatcher();
+//! let request = ToolCallRequest::from_compound(
+//!     "read-note", "workspace.read", json!({"path": "note.txt"}),
+//! ).expect("valid call");
+//! let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+//! let response = runtime.block_on(dispatcher.dispatch_one(request));
+//! assert!(response.ok);
+//! assert_eq!(response.result.expect("workspace read")["content"], "garden archive");
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod code_mode;
 pub mod ops;
