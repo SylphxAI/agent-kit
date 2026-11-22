@@ -5,6 +5,7 @@ members = [
     "crates/agent-ingress",
     "crates/agent-memory",
     "crates/agent-tools",
+    "tests/e2e",
 ]
 
 [workspace.package]

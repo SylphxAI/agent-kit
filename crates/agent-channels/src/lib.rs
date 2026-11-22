@@ -12,7 +12,10 @@
 //! - [`speech_gate`] decides whether an agent's terminal text may be delivered
 //!   to an external channel. It fails closed.
 //!
-//! A typical host pipeline:
+//! Channel metadata is not Instructions. Authenticate the event in the host,
+//! check ingress policy before wake, and check the speech gate before sending.
+//!
+//! ## Parse a forum message and prepare a reply
 //!
 //! ```
 //! use agent_channels::reply_target::{ReplyTarget, resolve_reply_target};
@@ -50,6 +53,9 @@
 //!     text: "Hi!",
 //! });
 //! assert_eq!(decision, TerminalDeliveryDecision::Deliver);
+//! let payload = target.telegram_send_message_payload("Hi!", Some(10)).unwrap();
+//! assert_eq!(payload["message_thread_id"], 54007);
+//! assert_eq!(payload["reply_parameters"]["message_id"], 10);
 //! ```
 
 pub mod reply_target;
