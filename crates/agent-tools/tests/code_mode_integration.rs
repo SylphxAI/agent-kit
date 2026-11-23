@@ -629,17 +629,44 @@ async fn js_console_keeps_completed_records_on_timeout() {
     if detect_js_runtime().is_err() {
         return;
     }
-    let runner = CodeModeRunner::new(ToolRegistry::new().into_dispatcher());
-    let res = runner
-        .execute_js_stdio(CodeExecRequest {
-            code:
-                r#"console.log("before timeout"); await new Promise((r) => setTimeout(r, 120000));"#
-                    .into(),
-            timeout_ms: Some(1000),
-            ..CodeExecRequest::default()
-        })
-        .await;
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let mut registry = ToolRegistry::new();
+    registry.mount(Arc::new(FnNamespaceHandler::new("fixture", &["wait"], {
+        let ready = Arc::clone(&ready);
+        move |_, _| {
+            let ready = Arc::clone(&ready);
+            async move {
+                ready.notify_one();
+                std::future::pending().await
+            }
+        }
+    })));
+    let runner = CodeModeRunner::new(registry.into_dispatcher());
+    let budget = Duration::from_secs(10);
+    let run = runner.execute_js_stdio(CodeExecRequest {
+        code: r#"console.log("before timeout"); await fixture.wait({});"#.into(),
+        timeout_ms: Some(budget.as_millis() as u64),
+        ..CodeExecRequest::default()
+    });
+    tokio::pin!(run);
+    // The host receives the fixture call only after console.log returns. Keep
+    // real time for worker startup, then expire the actual runner deadline.
+    tokio::select! {
+        () = ready.notified() => {},
+        res = &mut run => panic!("isolate exited before reaching fixture.wait: {res:?}"),
+    }
+    tokio::time::pause();
+    tokio::time::advance(budget).await;
+    let res = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("runner must terminate the isolate at its deadline");
     assert!(!res.ok);
+    assert!(
+        res.error
+            .as_deref()
+            .is_some_and(|err| err.contains("timed out")),
+        "{res:?}"
+    );
     assert!(res.logs_incomplete);
     assert_eq!(res.logs, ["before timeout"]);
     assert!(res.log_artifact.is_none());
