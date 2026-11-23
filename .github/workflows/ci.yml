@@ -59,14 +59,33 @@ jobs:
     if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg15-bookworm@sha256:e0b617fffc06dd37323ee99873c7a8683f19f1dce34633670262b0113ce32638
+        env:
+          POSTGRES_DB: memory_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d memory_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Test workspace (all features)
-        run: cargo test --workspace --all-features --locked
+      - name: Test workspace (all features, with live PostgreSQL)
+        env:
+          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGUSER: postgres
+          AGENT_MEMORY_TEST_POSTGRES_URL: postgres://127.0.0.1/memory_test
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test -p agent-memory --all-features --locked --test immutable_append postgres_immutable_append -- --ignored --exact
       - name: Run doctests (default features)
         run: cargo test --doc --workspace --locked
       - name: Check default features and individual memory backends

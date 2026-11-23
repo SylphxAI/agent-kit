@@ -15,7 +15,7 @@ use crate::{
     raw::{MAX_RAW_RANGE_BYTES, sha256_hex},
     store::{
         EmbeddingChunk, MemorySearchRequest, MemoryStore, RawCitation, RawRecordInput, SearchHit,
-        StoreError, StoreStats,
+        StoreError, StoreStats, immutable_record_conflict,
     },
     text::readable,
     tokenize::{
@@ -571,53 +571,61 @@ impl MemoryStore for PostgresPgvectorStore {
         })?;
         let raw_sha256 = sha256_hex(&record.raw_bytes);
         let raw_length = record.raw_bytes.len() as i64;
-        let search_text = build_search_text(&record.raw_bytes);
-        let tool_names = serde_json::to_value(&record.tool_names)?;
-
-        let row = sqlx::query(
-            "INSERT INTO memory_records (
-                id, agent_id, source, timestamp_ms, direction, sender, destination,
-                role, tool_name, tool_names, raw_bytes, raw_sha256, raw_length, search_text
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-             ON CONFLICT (id) DO UPDATE SET
-                timestamp_ms = EXCLUDED.timestamp_ms,
-                direction = EXCLUDED.direction,
-                sender = EXCLUDED.sender,
-                destination = EXCLUDED.destination,
-                role = EXCLUDED.role,
-                tool_name = EXCLUDED.tool_name,
-                tool_names = EXCLUDED.tool_names,
-                raw_bytes = EXCLUDED.raw_bytes,
-                raw_sha256 = EXCLUDED.raw_sha256,
-                raw_length = EXCLUDED.raw_length,
-                search_text = EXCLUDED.search_text
-             WHERE memory_records.agent_id = EXCLUDED.agent_id
-             RETURNING seq",
+        // Serialize admission for this ID, including when no row exists yet.
+        // Read committed gives the lookup a fresh snapshot after the lock wait.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&record.id)
+            .execute(&mut *tx)
+            .await?;
+        let existing: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT CASE WHEN agent_id = $2 AND raw_bytes = $3
+                              AND raw_sha256 = $4 AND raw_length = $5 THEN seq END
+             FROM memory_records WHERE id = $1",
         )
         .bind(&record.id)
         .bind(&record.agent_id)
-        .bind(source)
-        .bind(record.timestamp_ms)
-        .bind(&record.direction)
-        .bind(&record.sender)
-        .bind(&record.destination)
-        .bind(&record.role)
-        .bind(&record.tool_name)
-        .bind(tool_names)
         .bind(&record.raw_bytes)
         .bind(&raw_sha256)
         .bind(raw_length)
-        .bind(&search_text)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| {
-            StoreError::IntegrityMismatch(format!(
-                "record {} already exists under a different owner",
-                record.id
-            ))
-        })?;
+        .fetch_optional(&mut *tx)
+        .await?;
 
-        let seq: i64 = row.try_get("seq")?;
+        let seq: i64 = match existing {
+            Some(Some(seq)) => seq,
+            Some(None) => return Err(immutable_record_conflict(&record.id)),
+            None => {
+                let search_text = build_search_text(&record.raw_bytes);
+                let tool_names = serde_json::to_value(&record.tool_names)?;
+                sqlx::query_scalar(
+                    "INSERT INTO memory_records (
+                        id, agent_id, source, timestamp_ms, direction, sender, destination,
+                        role, tool_name, tool_names, raw_bytes, raw_sha256, raw_length, search_text
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                     RETURNING seq",
+                )
+                .bind(&record.id)
+                .bind(&record.agent_id)
+                .bind(source)
+                .bind(record.timestamp_ms)
+                .bind(&record.direction)
+                .bind(&record.sender)
+                .bind(&record.destination)
+                .bind(&record.role)
+                .bind(&record.tool_name)
+                .bind(tool_names)
+                .bind(&record.raw_bytes)
+                .bind(&raw_sha256)
+                .bind(raw_length)
+                .bind(&search_text)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
         Ok(RawCitation {
             document_id: record.id.clone(),
             agent_id: record.agent_id.clone(),
