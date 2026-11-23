@@ -69,10 +69,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --lock
 
 The purity check scans tracked files in the Git index. Stage any changes you want it to check locally. New external endpoints and repositories require an explicit allowlist entry; use reserved example domains in fixtures.
 
-For the opt-in live PostgreSQL test, set `AGENT_MEMORY_TEST_POSTGRES_URL` to the connection URL of a disposable database with `pgvector`, then run:
+For live PostgreSQL tests, set `AGENT_MEMORY_TEST_POSTGRES_URL` to the connection URL of a disposable database with `pgvector`, then run:
 
 ```sh
 cargo test -p agent-memory --features postgres --locked live_postgres_pgvector_end_to_end_when_configured
+cargo test -p agent-memory --features postgres --locked --test immutable_append postgres_immutable_append -- --ignored --exact
 ```
 
 ## License

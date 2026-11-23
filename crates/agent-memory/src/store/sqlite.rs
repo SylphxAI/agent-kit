@@ -13,7 +13,7 @@ use crate::{
     raw::{MAX_RAW_RANGE_BYTES, RawCoordinate, RawSegment, read_raw, read_raw_range, sha256_hex},
     store::{
         EmbeddingChunk, MemorySearchRequest, MemoryStore, RawCitation, RawRecordInput, SearchHit,
-        StoreError, StoreStats,
+        StoreError, StoreStats, immutable_record_conflict,
     },
     tokenize::{IndexMetadata, MemoryScope},
 };
@@ -37,7 +37,9 @@ impl SqliteStore {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(root.join("segments"))?;
         std::fs::create_dir_all(root.join("dense"))?;
-        let host = HostIndex::open(&root.join(INDEX_FILE))?;
+        // This index is the authority for document IDs. Do not auto-rebuild it
+        // on corruption: an unreadable ID mapping is not an empty store.
+        let host = HostIndex::open_strict(&root.join(INDEX_FILE))?;
         Ok(Self {
             root,
             state: Mutex::new(SqliteState {
@@ -106,17 +108,28 @@ impl SqliteStore {
                 "record source must be Memory or Transcripts, not All".into(),
             ));
         }
-        let seg_path = self.segment_path_for_agent(&record.agent_id);
         let mut state = self.lock_state()?;
-        if !state.segments.contains_key(&record.agent_id) {
-            let segment = RawSegment::open(&seg_path)?;
-            state.segments.insert(record.agent_id.clone(), segment);
+        let SqliteState { host, segments, .. } = &mut *state;
+        // A SQLite writer reservation also serializes independent store handles.
+        // Resolve the ID before opening or modifying any raw segment.
+        let tx = host.begin_write()?;
+        if let Some(existing) = HostIndex::document_by_id(&tx, &record.id)? {
+            if existing.metadata.agent_id != record.agent_id
+                || read_raw(&existing.raw)? != record.raw_bytes
+            {
+                return Err(immutable_record_conflict(&record.id));
+            }
+            return Ok(full_citation(record, existing.raw));
         }
-        let coord = state
-            .segments
-            .get(&record.agent_id)
-            .ok_or_else(|| StoreError::Backend("segment missing".into()))?
-            .append(&record.raw_bytes)?;
+
+        let entry = segments.entry(record.agent_id.clone());
+        let segment = match entry {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(RawSegment::open(
+                &self.segment_path_for_agent(&record.agent_id),
+            )?),
+        };
+        let coord = segment.append(&record.raw_bytes)?;
         let metadata = IndexMetadata {
             agent_id: record.agent_id.clone(),
             source: record.source,
@@ -128,16 +141,9 @@ impl SqliteStore {
             tool_names: record.tool_names.clone(),
             role: record.role.clone(),
         };
-        state.host.index(&record.id, &metadata, &coord)?;
-        Ok(RawCitation {
-            document_id: record.id.clone(),
-            agent_id: record.agent_id.clone(),
-            offset: 0,
-            length: coord.length,
-            sha256: coord.sha256.clone(),
-            raw_sha256: coord.sha256,
-            seq: coord.seq,
-        })
+        HostIndex::insert_new(&tx, &record.id, &metadata, &coord)?;
+        tx.commit()?;
+        Ok(full_citation(record, coord))
     }
 
     /// Synchronous convenience wrapper for [`MemoryStore::upsert_embeddings`].
@@ -211,6 +217,18 @@ impl SqliteStore {
             Self::open_or_get_dense(dense_path, &mut state.dense_spaces, vector_space, dims)?;
         dense.put(&dense_doc, &pieces, &[])?;
         Ok(())
+    }
+}
+
+fn full_citation(record: &RawRecordInput, coord: RawCoordinate) -> RawCitation {
+    RawCitation {
+        document_id: record.id.clone(),
+        agent_id: record.agent_id.clone(),
+        offset: 0,
+        length: coord.length,
+        sha256: coord.sha256.clone(),
+        raw_sha256: coord.sha256,
+        seq: coord.seq,
     }
 }
 

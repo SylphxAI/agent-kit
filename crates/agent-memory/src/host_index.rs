@@ -4,7 +4,10 @@
 //! requires an explicit caller-authorized owner set; an empty owner set returns
 //! zero results.
 
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value,
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -56,7 +59,7 @@ impl HostIndex {
         {
             fs::create_dir_all(parent)?;
         }
-        match Self::open_inner(path) {
+        match Self::open_strict(path) {
             Err(IndexError::Sql(error))
                 if error.to_string().contains("malformed")
                     || error.to_string().contains("not a database") =>
@@ -64,13 +67,13 @@ impl HostIndex {
                 let _ = fs::remove_file(path);
                 let _ = fs::remove_file(path.with_extension("db-wal"));
                 let _ = fs::remove_file(path.with_extension("db-shm"));
-                Self::open_inner(path)
+                Self::open_strict(path)
             }
             other => other,
         }
     }
 
-    fn open_inner(path: &Path) -> Result<Self, IndexError> {
+    pub(crate) fn open_strict(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(
@@ -206,12 +209,42 @@ impl HostIndex {
         }
         let prepared = prepare_document(&mut source, id, metadata, raw)?;
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
+        Self::insert_prepared(&tx, id, &prepared)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Reserve the database writer before checking the global document ID.
+    pub(crate) fn begin_write(&mut self) -> Result<Transaction<'_>, IndexError> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+
+    /// Insert a fresh document without replacing an existing ID.
+    pub(crate) fn insert_new(
+        tx: &Transaction<'_>,
+        id: &str,
+        metadata: &IndexMetadata,
+        raw: &RawCoordinate,
+    ) -> Result<(), IndexError> {
+        let mut source = RawSource::open(&raw.segment)?;
+        source.verify(raw)?;
+        let prepared = prepare_document(&mut source, id, metadata, raw)?;
+        Self::insert_prepared(tx, id, &prepared)
+    }
+
+    fn insert_prepared(
+        tx: &Transaction<'_>,
+        id: &str,
+        prepared: &PreparedDocument,
+    ) -> Result<(), IndexError> {
         let source_name = prepared
             .metadata
             .source
             .as_source()
             .ok_or_else(|| io::Error::other("an indexed document needs one source"))?;
-        tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
         tx.execute(
             "INSERT INTO host_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
@@ -248,8 +281,7 @@ impl HostIndex {
                 params![row, window.tokens],
             )?;
         }
-        tx.commit()?;
-        Ok(true)
+        Ok(())
     }
 
     /// Delete one document within `owners` ACL. Returns `true` if deleted.
@@ -304,15 +336,20 @@ impl HostIndex {
             .collect()
     }
 
-    /// Internal lookup by document ID without owner filtering, used strictly by
-    /// write-side embedding indexers attaching vectors to an existing record.
+    /// Internal lookup by global ID for append admission and embedding indexing.
     pub(crate) fn document_unfiltered(&self, id: &str) -> Result<Option<IndexHit>, IndexError> {
+        Self::document_by_id(&self.conn, id)
+    }
+
+    pub(crate) fn document_by_id(
+        conn: &Connection,
+        id: &str,
+    ) -> Result<Option<IndexHit>, IndexError> {
         let sql = "SELECT id,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role,
                 segment,offset,length,sha256,seq,
                 (SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))
              FROM host_documents d WHERE id=?1";
-        Ok(self
-            .conn
+        Ok(conn
             .query_row(sql, [id], |r| {
                 let raw = RawCoordinate {
                     segment: r.get::<_, String>(9)?.into(),

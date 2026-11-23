@@ -52,6 +52,13 @@ pub enum StoreError {
     Backend(String),
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn immutable_record_conflict(id: &str) -> StoreError {
+    StoreError::IntegrityMismatch(format!(
+        "immutable record {id} already exists with a different owner or payload"
+    ))
+}
+
 /// An immutable raw event or document appended to a [`MemoryStore`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawRecordInput {
@@ -168,6 +175,9 @@ pub trait MemoryStore: Send + Sync {
     async fn migrate(&self) -> Result<(), StoreError>;
 
     /// Append an immutable raw record and index it for lexical search.
+    /// An existing ID can only be retried by the same owner with identical raw
+    /// bytes; this returns the original citation without updating metadata.
+    /// A different owner or payload fails with [`StoreError::IntegrityMismatch`].
     async fn append_record(&self, record: &RawRecordInput) -> Result<RawCitation, StoreError>;
 
     /// Store or replace dense embedding chunks for an existing record within `vector_space`.
