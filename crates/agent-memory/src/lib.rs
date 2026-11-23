@@ -34,6 +34,7 @@
 //! ```
 
 pub mod fusion;
+pub mod lexical;
 pub mod notes;
 pub mod protocol;
 pub mod raw;
@@ -62,6 +63,10 @@ pub mod runtime;
 pub mod service;
 
 pub use fusion::{K as RRF_K, reciprocal_rank};
+pub use lexical::{
+    LexicalConfig, LexicalDocument, LexicalHit, score_lexical_documents,
+    score_lexical_documents_with_config,
+};
 pub use raw::{MAX_RAW_RANGE_BYTES, RawCoordinate, RawSegment, read_raw, read_raw_range};
 pub use store::{
     EmbeddingChunk, MemorySearchRequest, MemoryStore, RawCitation, RawRecordInput, SearchHit,

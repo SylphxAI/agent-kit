@@ -201,8 +201,7 @@ pub fn tokenize_hybrid_search_tokens(text: &str) -> Vec<String> {
     )
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SearchTerm {
     Token(String),
     CjkPhrase(Vec<String>),
@@ -211,7 +210,6 @@ pub(crate) enum SearchTerm {
 /// A multi-character CJK run matches only its ordered, adjacent bigrams. A
 /// phrase of unigrams could match separately delimited characters in the
 /// existing index; OR-ing bigrams could match only part of a longer compound.
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
 pub(crate) fn tokenize_search_terms(text: &str) -> Vec<SearchTerm> {
     scan_tokens(
         text,
