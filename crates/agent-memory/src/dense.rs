@@ -60,6 +60,17 @@ fn dot(query: &[f32], scale: f32, bytes: &[u8]) -> f32 {
     sum * scale
 }
 
+/// Score transient vectors using the same quantized dot product as indexed retrieval.
+#[cfg(all(feature = "service", unix))]
+pub(crate) fn transient_similarity(query: &[f32], passage: &[f32]) -> Option<f32> {
+    if query.is_empty() || query.len() != passage.len() || !passage.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let (scale, bytes) = quantize(passage);
+    let score = dot(query, scale, &bytes);
+    score.is_finite().then_some(score)
+}
+
 impl DenseIndex {
     /// Open or create the index of one vector space, named by `space` and `dims`.
     /// A file built in another space is emptied: its vectors are not comparable.
@@ -322,6 +333,21 @@ impl DenseIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "service", unix))]
+    #[test]
+    fn transient_similarity_uses_the_indexed_dot_product() {
+        let query = [1., 0.];
+        let passage = [0.8, 0.6];
+        let (scale, bytes) = quantize(&passage);
+        assert_eq!(
+            transient_similarity(&query, &passage),
+            Some(dot(&query, scale, &bytes))
+        );
+        assert!(transient_similarity(&query, &passage) > transient_similarity(&query, &[0., 1.]));
+        assert_eq!(transient_similarity(&query, &[f32::NAN, 0.]), None);
+        assert_eq!(transient_similarity(&query, &[1.]), None);
+    }
 
     fn unit(v: &[f32]) -> Vec<f32> {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();

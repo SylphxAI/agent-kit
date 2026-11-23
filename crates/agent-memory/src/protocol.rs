@@ -2,7 +2,8 @@
 //! newline-delimited JSON requests and responses over a Unix domain socket
 //! owned by the operator. The caller sends already-authorized owner IDs; the
 //! service never decides access and never returns raw text, only exact raw-byte
-//! coordinates the caller verifies before reading a byte.
+//! coordinates the caller verifies before reading a byte. Caller-owned passage
+//! scoring is a separate, non-indexing operation.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,22 @@ use std::{
 
 /// Wire version. A service answering another version is refused.
 pub const VERSION: u32 = 1;
+
+/// Work bounds for one scoped dense request; model-specific token limits still apply.
+pub const SCOPED_DENSE_MAX_PASSAGES: usize = 32;
+pub const SCOPED_DENSE_MAX_TEXT_BYTES: usize = 2048;
+
+#[cfg(unix)]
+pub(crate) fn check_dense_inputs(query: &str, passages: &[String]) -> Result<(), &'static str> {
+    let valid = |text: &str| !text.trim().is_empty() && text.len() <= SCOPED_DENSE_MAX_TEXT_BYTES;
+    if !valid(query)
+        || !(1..=SCOPED_DENSE_MAX_PASSAGES).contains(&passages.len())
+        || !passages.iter().all(|text| valid(text))
+    {
+        return Err("scoped dense request exceeds passage or text bounds, or contains empty text");
+    }
+    Ok(())
+}
 
 /// The service socket inside a data directory.
 pub fn socket_path(data_dir: &Path) -> PathBuf {
@@ -38,6 +55,11 @@ pub enum Request {
         #[serde(default)]
         until_ms: Option<i64>,
         limit: usize,
+    },
+    /// Dense similarity for caller-owned passages. Never indexed or sent to a remote provider.
+    DenseScores {
+        query: String,
+        passages: Vec<String>,
     },
     /// Cross-encoder relevance of each passage to `query`, in input order.
     Rerank {
@@ -115,6 +137,7 @@ pub struct Rebuild {
 #[serde(untagged)]
 pub enum Reply {
     Search { hits: Vec<DenseHit>, status: Status },
+    DenseScores { similarities: Vec<f32> },
     Rerank { scores: Vec<f32> },
     Status { status: Status },
 }
@@ -254,6 +277,24 @@ impl Client {
         }
     }
 
+    /// One similarity per input position. No document IDs are sent to the service.
+    pub fn dense_scores(&self, query: &str, passages: &[String]) -> Result<Vec<f32>, String> {
+        check_dense_inputs(query, passages)?;
+        match self.call(&Request::DenseScores {
+            query: query.into(),
+            passages: passages.to_vec(),
+        })? {
+            Reply::DenseScores { similarities }
+                if similarities.len() == passages.len()
+                    && similarities.iter().all(|score| score.is_finite()) =>
+            {
+                Ok(similarities)
+            }
+            Reply::DenseScores { .. } => Err("invalid scoped dense similarities".into()),
+            _ => Err("memory service answered another request".into()),
+        }
+    }
+
     pub fn rerank(&self, query: &str, passages: &[String]) -> Result<Vec<f32>, String> {
         match self.call(&Request::Rerank {
             query: query.into(),
@@ -314,6 +355,44 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn scoped_dense_contract_requires_bounded_inputs_and_one_score_per_passage() {
+        use std::os::unix::net::UnixListener;
+
+        let query = "automobile";
+        let passages = vec!["vehicle maintenance".into(), "seed packets".into()];
+        assert!(check_dense_inputs(query, &[]).is_err());
+        assert!(
+            check_dense_inputs(query, &vec!["valid".into(); SCOPED_DENSE_MAX_PASSAGES + 1])
+                .is_err()
+        );
+        assert!(check_dense_inputs(query, &["x".repeat(SCOPED_DENSE_MAX_TEXT_BYTES + 1)]).is_err());
+        assert!(check_dense_inputs(" ", &passages).is_err());
+        let expected = Request::DenseScores {
+            query: query.into(),
+            passages: passages.clone(),
+        };
+        let dir = crate::test_tempdir();
+        let path = socket_path(dir.path());
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            for similarities in [vec![0.91, -0.1], vec![0.91]] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                assert_eq!(decode_request(&line).unwrap(), expected);
+                stream
+                    .write_all(encode_reply(&Ok(Reply::DenseScores { similarities })).as_bytes())
+                    .unwrap();
+            }
+        });
+        let client = Client::new(path, Duration::from_secs(2));
+        assert_eq!(client.dense_scores(query, &passages).unwrap(), [0.91, -0.1]);
+        assert!(client.dense_scores(query, &passages).is_err());
+        worker.join().unwrap();
+    }
+
     #[test]
     fn an_absent_service_is_an_error_not_a_wait() {
         let dir = crate::test_tempdir();

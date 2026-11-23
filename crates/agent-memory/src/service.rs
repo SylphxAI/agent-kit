@@ -605,6 +605,38 @@ impl Shared {
                     status: self.status()?,
                 })
             }
+            Request::DenseScores { query, passages } => {
+                protocol::check_dense_inputs(&query, &passages)?;
+                // Do not queue behind other expensive requests: callers can fall back
+                // to their local lexical path rather than stacking timed-out work.
+                let mut embedder = self
+                    .embedder
+                    .try_lock()
+                    .map_err(|_| "embedder unavailable")?;
+                if embedder.is_remote() {
+                    return Err("scoped dense scoring requires a local embedder".into());
+                }
+                let texts: Vec<String> = passages.iter().map(|p| readable(p.as_bytes())).collect();
+                let query_vectors = embedder.embed_queries(&[&query])?;
+                let [query_vector] = query_vectors.as_slice() else {
+                    return Err("invalid scoped query embedding".into());
+                };
+                let mut similarities = Vec::with_capacity(texts.len());
+                for batch in texts.chunks(embedder.batch()) {
+                    let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+                    let vectors = embedder.embed_passages(&refs)?;
+                    if vectors.len() != refs.len() {
+                        return Err("invalid scoped passage embeddings".into());
+                    }
+                    for vector in vectors {
+                        similarities.push(
+                            crate::dense::transient_similarity(query_vector, &vector)
+                                .ok_or("invalid scoped vector similarity")?,
+                        );
+                    }
+                }
+                Ok(Reply::DenseScores { similarities })
+            }
             Request::Rerank { query, passages } => {
                 let texts: Vec<String> = passages.iter().map(|p| readable(p.as_bytes())).collect();
                 let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
@@ -1143,6 +1175,23 @@ mod tests {
         let reranked: Vec<&str> = order.iter().map(|(_, id)| id.as_str()).collect();
         assert_eq!(reranked, ["agt-3", "agt-1", "agt-0", "agt-2"]);
         assert!(!seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_dense_scores_refuse_remote_provider_without_network_or_index_access() {
+        let dir = crate::test_tempdir();
+        openrouter_profile(dir.path());
+        let (url, seen) = crate::providers::tests::serve(|_, _| (500, json!({})));
+        let mut config = Config::new(dir.path());
+        config.no_index = true;
+        config.providers = remote_pair(&url, Some(0.01), 10.0);
+        let client = start(config);
+        let error = client
+            .dense_scores("automobile", &["vehicle maintenance".into()])
+            .unwrap_err();
+        assert!(error.contains("requires a local embedder"), "{error}");
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!dir.path().join(HOST_INDEX).exists());
     }
 
     #[test]
