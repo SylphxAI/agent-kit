@@ -34,7 +34,6 @@ SYNTAX = {
     ("crates/agent-memory/src/raw.rs", "m.dev"): "m.dev()",
     ("Cargo.toml", "profile.dev"): "[profile.dev.package.",
     ("Cargo.toml", "profile.test"): "[profile.test.package.",
-    (".github/workflows/ci.yml", "github.event.repository.private"): "github.event.repository.private == false",
 }
 POLICY_SOURCE = "scripts/check-oss-purity.py"
 # Shared hosting is not evidence that the target repository is public.

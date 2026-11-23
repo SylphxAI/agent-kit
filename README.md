@@ -67,7 +67,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 ```
 
-The purity check scans tracked files in the Git index. Stage any changes you want it to check locally. New external endpoints and repositories require an explicit allowlist entry; use reserved example domains in fixtures.
+The local check enforces the repository’s endpoint and repository allowlists and requires tracked files to be UTF-8 text. Stage any changes you want it to check locally, and use reserved example domains in fixtures. CI also checks changed files for internal references and destructive SQL migrations.
 
 For live PostgreSQL tests, set `AGENT_MEMORY_TEST_POSTGRES_URL` to the connection URL of a disposable database with `pgvector`, then run:
 
