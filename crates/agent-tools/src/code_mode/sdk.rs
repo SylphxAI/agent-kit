@@ -12,10 +12,34 @@ use crate::code_mode::registry::ToolRegistry;
 /// - Worker -> Host: `{"type":"batch","calls":[{"id":1,"namespace":"...","method":"...","params":{}}]}`
 /// - Host -> Worker: `{"type":"batch_reply","replies":[{"id":1,"ok":true,"result":...}]}`
 /// - Worker -> Host: `{"type":"done","ok":true,"result":...,"logs":[...]}`
+///
+/// When the runner supplies `AGENT_CODE_CONSOLE_FILE`, the worker instead writes
+/// console records to that private file, and reports any write failure as `logError`.
 pub const SANDBOX_WORKER_JS: &str = r#"
 const Module = require("module");
 const vm = require("vm");
 const readline = require("readline");
+const consolePath = process.env.AGENT_CODE_CONSOLE_FILE;
+let writeConsoleRecord;
+let logError;
+if (consolePath !== undefined) {
+  try {
+    const fs = require("fs");
+    const fd = fs.openSync(consolePath, "a");
+    const toBytes = Buffer.from.bind(Buffer);
+    writeConsoleRecord = (line) => {
+      const bytes = toBytes(line, "utf8");
+      let offset = 0;
+      while (offset < bytes.length) {
+        const n = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+        if (n <= 0) throw new Error("console write made no progress");
+        offset += n;
+      }
+    };
+  } catch {
+    logError = "could not open console log spool";
+  }
+}
 
 const isBun = typeof Bun !== "undefined";
 const stripTS =
@@ -68,14 +92,21 @@ let nextId = 1;
 let queuedCalls = [];
 let flushScheduled = false;
 const logs = [];
-const MAX_LOGS = 200;
-const MAX_LOG_LEN = 4096;
 
 function hostLogRaw(level, text) {
-  if (logs.length >= MAX_LOGS) return;
+  if (logError) return;
   const prefix = level === "log" ? "" : `[${level}] `;
   const msg = prefix + String(text);
-  logs.push(msg.length > MAX_LOG_LEN ? msg.slice(0, MAX_LOG_LEN) + "...(truncated)" : msg);
+  if (!writeConsoleRecord) {
+    logs.push(msg);
+    return;
+  }
+  try {
+    writeConsoleRecord(JSON.stringify(msg) + "\n");
+  } catch {
+    // Do not pass an outer-realm filesystem exception into the snippet.
+    logError = "could not write console log spool";
+  }
 }
 
 function flushBatch() {
@@ -170,6 +201,7 @@ rl.on("line", async (line) => {
   }
   if (msg.type === "start") {
     try {
+      if (logError) throw new Error(logError);
       const ctx = vm.createContext(Object.create(null), {
         codeGeneration: { strings: false, wasm: false },
       });
@@ -257,7 +289,7 @@ rl.on("line", async (line) => {
         fn = compileUserCode(msg.code, ctx);
       } catch (err) {
         stdoutWrite(
-          JSON.stringify({ type: "done", ok: false, phase: "compile", error: compileError(err), logs }) + "\n",
+          JSON.stringify({ type: "done", ok: false, phase: "compile", error: compileError(err), logs, logError }) + "\n",
           () => exitProcess(0)
         );
         return;
@@ -275,15 +307,15 @@ rl.on("line", async (line) => {
       const safeResult = result === undefined ? null : result;
       let doneLine;
       try {
-        doneLine = JSON.stringify({ type: "done", ok: true, result: safeResult, logs }) + "\n";
+        doneLine = JSON.stringify({ type: "done", ok: true, result: safeResult, logs, logError }) + "\n";
       } catch {
-        doneLine = JSON.stringify({ type: "done", ok: true, result: String(safeResult), logs }) + "\n";
+        doneLine = JSON.stringify({ type: "done", ok: true, result: String(safeResult), logs, logError }) + "\n";
       }
       stdoutWrite(doneLine, () => exitProcess(0));
     } catch (err) {
       const errMsg = err && err.stack ? String(err.stack) : String(err);
       stdoutWrite(
-        JSON.stringify({ type: "done", ok: false, error: errMsg, logs }) + "\n",
+        JSON.stringify({ type: "done", ok: false, error: errMsg, logs, logError }) + "\n",
         () => exitProcess(0)
       );
     }

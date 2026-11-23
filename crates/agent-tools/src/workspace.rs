@@ -1,14 +1,12 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::encoding::{base64_decode, base64_encode, sha256_hex, url_encode_query_component};
 use crate::path::resolve_workspace_path;
 use crate::sandbox::{DEFAULT_EXEC_TIMEOUT_MS, SandboxConfig, ureq_agent};
-
-/// Longest wall time a remote sandbox (`cloud-sandbox`, `e2b`) runs a single command.
-pub const REMOTE_EXEC_MAX_TIMEOUT_MS: u64 = 120_000;
 
 /// Captured output of a shell command executed inside a [`WorkspaceBackend`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +306,8 @@ impl WorkspaceBackend for LocalWorkspace {
 }
 
 /// Remote HTTP / Cloud Sandbox / E2B workspace backend driven by [`SandboxConfig`].
+/// `exec` sends the caller's positive timeout unchanged, or 30 seconds when
+/// absent. The endpoint owns enforcement of that command timeout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteSandboxWorkspace {
     pub config: SandboxConfig,
@@ -354,9 +354,10 @@ impl WorkspaceBackend for RemoteSandboxWorkspace {
         if cmd_trimmed.is_empty() {
             return Err("`workspace.exec` requires a non-empty `cmd`".to_string());
         }
-        let effective_timeout = timeout_ms
-            .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
-            .clamp(100, REMOTE_EXEC_MAX_TIMEOUT_MS);
+        let effective_timeout = timeout_ms.unwrap_or(DEFAULT_EXEC_TIMEOUT_MS);
+        if effective_timeout == 0 {
+            return Err("remote exec timeout_ms must be positive".into());
+        }
         let resolved_cwd = self.resolve_path(cwd, false)?;
         remote_exec(&self.config, cmd_trimmed, &resolved_cwd, effective_timeout)
     }
@@ -619,7 +620,23 @@ fn remote_exec(
         cfg.endpoint.trim_end_matches('/'),
         url_encode_query_component(&cfg.sandbox_id)
     );
-    let agent = ureq_agent(timeout_ms);
+    // This endpoint can stay silent until completion. Use the requested command
+    // budget plus response/transport grace, not a shorter assumed heartbeat.
+    let grace = Duration::from_secs(5);
+    let response_budget = Duration::from_millis(timeout_ms) + grace;
+    if Instant::now().checked_add(response_budget).is_none() {
+        return Err("remote exec timeout_ms is not representable on this platform".into());
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(response_budget))
+        .timeout_connect(Some(grace))
+        .timeout_resolve(Some(grace))
+        .timeout_send_request(Some(grace))
+        .timeout_send_body(Some(grace))
+        .http_status_as_error(false)
+        .user_agent("agent-tools")
+        .build()
+        .into();
     let mut req = agent.post(&url).header("content-type", "application/json");
     if let Some(ref token) = cfg.token {
         req = req.header("authorization", &format!("Bearer {token}"));
@@ -634,7 +651,10 @@ fn remote_exec(
         .map_err(|e| format!("remote sandbox exec request failed ({url}): {e}"))?;
     let status = resp.status().as_u16();
     let mut body = Vec::new();
-    let _ = resp.body_mut().as_reader().read_to_end(&mut body);
+    resp.body_mut()
+        .as_reader()
+        .read_to_end(&mut body)
+        .map_err(|e| format!("remote sandbox exec response incomplete (HTTP {status}): {e}"))?;
     if !(200..300).contains(&status) {
         let msg = String::from_utf8_lossy(&body);
         return Err(format!("remote sandbox exec returned HTTP {status}: {msg}"));

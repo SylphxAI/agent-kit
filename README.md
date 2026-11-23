@@ -51,6 +51,10 @@ The host authenticates the inbound event, resolves sender relationships independ
 
 `WorkspaceBackend` routes file and command operations through a local, Docker, remote sandbox, or caller-provided adapter. The crate also provides web utilities with an SSRF guard and `SKILL.md` discovery. Code Mode offers NDJSON stdio and loopback HTTP JSON-RPC dispatch. The host chooses which namespaces to mount via `ToolRegistry`; unmounted namespaces and unknown methods fail closed. Configure tools and isolation for the trust level of the input, and run untrusted JavaScript in an OS/container sandbox rather than treating a JavaScript VM as the security boundary.
 
+Remote workspace `exec` uses a caller-provided positive `timeout_ms` without a library ceiling; if omitted, the command budget is 30 seconds. The remote endpoint must honor that budget and may enforce its own policy. This synchronous endpoint need not send heartbeats: the client bounds connection and send phases and waits up to the command budget plus five seconds for the HTTP exchange. A client-side timeout is not confirmation that the command stopped remotely.
+
+The stdio runner (`execute_js_stdio` / `agent-code-mode run`) returns console records in order. The compact JSON `logs` array has its own `max_output_bytes` budget, separate from `result`. When the full array would exceed the budget, `logs` contains only whole leading records and `log_artifact` names a private UTF-8 JSON Lines file on the runner's filesystem. The file contains **all** captured records, including the inline ones, with one JSON string per line and explicit `entries` and `bytes` counts. Read it on the runner and remove it when no longer needed; callers requiring long-term retention should move it out of the temporary directory. `logs_incomplete: true` means capture was interrupted (for example, by a timeout or spool write failure); available records are still returned. The `truncated` flag describes `result`, not console logs.
+
 ## Verify the workspace
 
 ```sh

@@ -26,6 +26,7 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
 
 use crate::{
     code_mode::{
+        console::collect_console,
         contract::{CodeLimits, code_timeout_message, diagnose, truncate_json_output},
         protocol::{
             CodeExecRequest, CodeExecResult, JsonRpcPayload, JsonRpcResponse,
@@ -123,6 +124,8 @@ impl CodeModeRunner {
                     ok: all_ok,
                     result: bounded.value,
                     logs: Vec::new(),
+                    log_artifact: None,
+                    logs_incomplete: false,
                     duration_ms: started.elapsed().as_millis() as u64,
                     truncated: bounded.truncated,
                     original_bytes: bounded.original_bytes,
@@ -139,6 +142,8 @@ impl CodeModeRunner {
                 ok: false,
                 result: Value::Null,
                 logs: Vec::new(),
+                log_artifact: None,
+                logs_incomplete: false,
                 duration_ms: started.elapsed().as_millis() as u64,
                 truncated: false,
                 original_bytes: 0,
@@ -173,6 +178,8 @@ impl CodeModeRunner {
                     ok: false,
                     result: Value::Null,
                     logs: Vec::new(),
+                    log_artifact: None,
+                    logs_incomplete: false,
                     duration_ms: 0,
                     truncated: false,
                     original_bytes: 0,
@@ -183,8 +190,22 @@ impl CodeModeRunner {
             }
         };
 
+        let spool = match tempfile::Builder::new()
+            .prefix("agent-code-console-")
+            .tempfile()
+        {
+            Ok(file) => file,
+            Err(err) => {
+                return error_result(
+                    started,
+                    &format!("failed to create console log spool: {err}"),
+                    0,
+                );
+            }
+        };
         let mut cmd = Command::new(&runtime_bin);
         cmd.env_clear()
+            .env("AGENT_CODE_CONSOLE_FILE", spool.path())
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("NODE_NO_WARNINGS", "1");
         if let Some(home) = std::env::var_os("HOME") {
@@ -218,6 +239,8 @@ impl CodeModeRunner {
                     ok: false,
                     result: Value::Null,
                     logs: Vec::new(),
+                    log_artifact: None,
+                    logs_incomplete: false,
                     duration_ms: started.elapsed().as_millis() as u64,
                     truncated: false,
                     original_bytes: 0,
@@ -357,77 +380,88 @@ impl CodeModeRunner {
         drop(shared_stdin);
 
         let total_calls = call_counter.load(Ordering::SeqCst);
-        let done_msg = match outcome {
-            Ok(Ok(msg)) => {
-                child_guard.stop();
-                msg
+        child_guard.stop();
+        let interrupted = !matches!(outcome, Ok(Ok(_)));
+        let (mut result, log_error) = match outcome {
+            Ok(Ok(done_msg)) => {
+                let log_error = done_msg
+                    .get("logError")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let ok = done_msg.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let result = if ok {
+                    let raw = done_msg.get("result").cloned().unwrap_or(Value::Null);
+                    let bounded = truncate_json_output(raw, max_output_bytes);
+                    CodeExecResult {
+                        ok: true,
+                        result: bounded.value,
+                        logs: Vec::new(),
+                        log_artifact: None,
+                        logs_incomplete: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        truncated: bounded.truncated,
+                        original_bytes: bounded.original_bytes,
+                        tool_calls: total_calls,
+                        error: None,
+                        fix: None,
+                    }
+                } else {
+                    let err = done_msg
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown code execution error");
+                    let compile = done_msg.get("phase").and_then(Value::as_str) == Some("compile");
+                    let mut result = error_result(started, err, total_calls);
+                    result.fix = diagnose(&request.code, err, compile, &specs);
+                    result
+                };
+                (result, log_error)
             }
             Ok(Err(err)) => {
-                child_guard.stop();
                 let stderr = stderr_handle.join().unwrap_or_default();
                 let full_err = if stderr.trim().is_empty() {
                     err
                 } else {
                     format!("{err}: {}", stderr.trim())
                 };
-                return error_result(started, &full_err, total_calls);
+                (error_result(started, &full_err, total_calls), None)
             }
-            Err(_) => {
-                child_guard.stop();
-                return error_result(
+            Err(_) => (
+                error_result(
                     started,
                     &code_timeout_message(timeout_ms, request.timeout_ms, self.limits.max_ms),
                     total_calls,
-                );
-            }
+                ),
+                None,
+            ),
         };
 
-        let logs: Vec<String> = done_msg
-            .get("logs")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let ok = done_msg.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if !ok {
-            let err = done_msg
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown code execution error")
-                .to_owned();
-            let compile = done_msg.get("phase").and_then(Value::as_str) == Some("compile");
-            let fix = diagnose(&request.code, &err, compile, &specs);
-            return CodeExecResult {
-                ok: false,
-                result: Value::Null,
-                logs,
-                duration_ms: started.elapsed().as_millis() as u64,
-                truncated: false,
-                original_bytes: 0,
-                tool_calls: total_calls,
-                error: Some(err),
-                fix,
-            };
+        let mut capture_error = log_error;
+        match collect_console(spool, max_output_bytes) {
+            Ok(capture) => {
+                result.logs = capture.logs;
+                result.log_artifact = capture.artifact;
+                if capture.partial_record && !interrupted && capture_error.is_none() {
+                    capture_error = Some("console log spool ended with a partial record".into());
+                }
+            }
+            Err(err) => {
+                let message = format!("failed to read or retain console log spool: {err}");
+                capture_error = Some(match capture_error {
+                    Some(first) => format!("{first}; {message}"),
+                    None => message,
+                });
+            }
         }
-
-        let raw_result = done_msg.get("result").cloned().unwrap_or(Value::Null);
-        let bounded = truncate_json_output(raw_result, max_output_bytes);
-        CodeExecResult {
-            ok: true,
-            result: bounded.value,
-            logs,
-            duration_ms: started.elapsed().as_millis() as u64,
-            truncated: bounded.truncated,
-            original_bytes: bounded.original_bytes,
-            tool_calls: total_calls,
-            error: None,
-            fix: None,
+        result.logs_incomplete = interrupted || capture_error.is_some();
+        if let Some(message) = capture_error {
+            result.ok = false;
+            result.error = Some(match result.error.take() {
+                Some(err) => format!("{err}; {message}"),
+                None => message,
+            });
         }
+        result
     }
 
     /// Execute a JS/TS snippet strictly **inside** the target [`WorkspaceBackend`]
@@ -495,6 +529,8 @@ impl CodeModeRunner {
                         ok: false,
                         result: Value::Null,
                         logs,
+                        log_artifact: None,
+                        logs_incomplete: false,
                         duration_ms: started.elapsed().as_millis() as u64,
                         truncated: false,
                         original_bytes: 0,
@@ -509,6 +545,8 @@ impl CodeModeRunner {
                     ok: true,
                     result: bounded.value,
                     logs,
+                    log_artifact: None,
+                    logs_incomplete: false,
                     duration_ms: started.elapsed().as_millis() as u64,
                     truncated: bounded.truncated,
                     original_bytes: bounded.original_bytes,
@@ -758,6 +796,8 @@ fn error_result(started: Instant, message: &str, tool_calls: usize) -> CodeExecR
         ok: false,
         result: Value::Null,
         logs: Vec::new(),
+        log_artifact: None,
+        logs_incomplete: false,
         duration_ms: started.elapsed().as_millis() as u64,
         truncated: false,
         original_bytes: 0,

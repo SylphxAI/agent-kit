@@ -538,3 +538,109 @@ async fn js_stdio_isolate_proves_promise_all_host_free_isolation_timeout_and_tru
     );
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+#[tokio::test]
+async fn js_console_keeps_more_than_200_records_and_long_unicode_inline() {
+    if detect_js_runtime().is_err() {
+        return;
+    }
+    let runner = CodeModeRunner::new(ToolRegistry::new().into_dispatcher());
+    let res = runner
+        .execute_js_stdio(CodeExecRequest {
+            code: r#"
+              for (let i = 0; i < 225; i++) console.log(`record-${i}`);
+              console.debug("界🙂".repeat(2100) + "\n\0end");
+              return 42;
+            "#
+            .into(),
+            ..CodeExecRequest::default()
+        })
+        .await;
+    assert!(res.ok, "{res:?}");
+    let mut expected: Vec<_> = (0..225).map(|i| format!("record-{i}")).collect();
+    expected.push(format!("[debug] {}\n\0end", "界🙂".repeat(2100)));
+    assert_eq!(res.logs, expected);
+    assert!(res.log_artifact.is_none());
+    assert!(!res.logs_incomplete);
+    assert_eq!(res.result, 42);
+}
+
+#[test]
+fn cli_console_overflow_recovers_every_record_after_snippet_error() {
+    if detect_js_runtime().is_err() {
+        return;
+    }
+    let workdir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_agent-code-mode"))
+        .args(["run", "--max-output-bytes", "128", "--workdir"])
+        .arg(workdir.path())
+        .args([
+            "--code",
+            r#"
+              console.log("starts inline");
+              console.warn("界🙂".repeat(2300) + "\n\0tail");
+              for (let i = 0; i < 220; i++) console.info(`record-${i}`);
+              console.error("terminal");
+              throw new Error("snippet failed");
+            "#,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let res: agent_tools::code_mode::CodeExecResult = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(res.error.unwrap().contains("snippet failed"));
+    assert!(!res.logs_incomplete);
+    assert_eq!(res.logs, ["starts inline"]);
+    assert!(serde_json::to_vec(&res.logs).unwrap().len() <= 128);
+    let artifact = res
+        .log_artifact
+        .expect("overflow must be independently retrievable");
+    let raw = std::fs::read_to_string(&artifact.path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&artifact.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+    }
+    std::fs::remove_file(&artifact.path).unwrap();
+    assert_eq!(artifact.entries, 223);
+    assert_eq!(artifact.bytes, raw.len() as u64);
+    let captured: Vec<String> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut expected = vec![
+        "starts inline".into(),
+        format!("[warn] {}\n\0tail", "界🙂".repeat(2300)),
+    ];
+    expected.extend((0..220).map(|i| format!("[info] record-{i}")));
+    expected.push("[error] terminal".into());
+    assert_eq!(captured, expected);
+}
+
+#[tokio::test]
+async fn js_console_keeps_completed_records_on_timeout() {
+    if detect_js_runtime().is_err() {
+        return;
+    }
+    let runner = CodeModeRunner::new(ToolRegistry::new().into_dispatcher());
+    let res = runner
+        .execute_js_stdio(CodeExecRequest {
+            code:
+                r#"console.log("before timeout"); await new Promise((r) => setTimeout(r, 120000));"#
+                    .into(),
+            timeout_ms: Some(1000),
+            ..CodeExecRequest::default()
+        })
+        .await;
+    assert!(!res.ok);
+    assert!(res.logs_incomplete);
+    assert_eq!(res.logs, ["before timeout"]);
+    assert!(res.log_artifact.is_none());
+}
