@@ -2,10 +2,9 @@ name: ci
 
 # Format, clippy, docs, and unit/integration tests for the workspace.
 #
-# GitHub-hosted standard runners are free only on a public repository, so
-# every job carries `github.event.repository.private == false`: a private copy
-# of this repository runs no hosted minutes. `runs-on` names hosted labels only,
-# so fork pull requests never reach a self-hosted runner.
+# Jobs that execute this repository's code use standard hosted runners only
+# when the caller is public. The shared baseline inspects Git objects without
+# executing caller code.
 #
 # `ci-ok` is the one required check; it runs no repository code.
 
@@ -30,15 +29,30 @@ env:
   CARGO_INCREMENTAL: '0'
 
 jobs:
+  changes:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: SylphxAI/.github/.github/workflows/changes.yml@6e0fab5388f5ae44afdd17abb2ec6c9b26f80b0e
+    with:
+      runner: ubuntu-latest
+
+  shared-baseline:
+    needs: changes
+    if: github.event.repository.visibility == 'public' || needs.changes.outputs.migrations != 'false'
+    uses: SylphxAI/.github/.github/workflows/shared-baseline-check.yml@6e0fab5388f5ae44afdd17abb2ec6c9b26f80b0e
+    with:
+      migrations: ${{ needs.changes.outputs.migrations }}
+
   lint:
-    if: github.event.repository.private == false
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: OSS source purity
+      - name: Verify approved references and tracked text
         run: python3 scripts/check-oss-purity.py
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
@@ -56,7 +70,7 @@ jobs:
           cargo doc --workspace --no-deps --all-features --locked
 
   test:
-    if: github.event.repository.private == false
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -80,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Test workspace (all features, with live PostgreSQL)
         env:
-          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGPORT: ${{ job.services.postgres.ports['5432'] }}
           PGUSER: postgres
           AGENT_MEMORY_TEST_POSTGRES_URL: postgres://127.0.0.1/memory_test
         run: |
@@ -95,8 +109,8 @@ jobs:
           cargo check -p agent-memory --no-default-features --features postgres --locked
 
   ci-ok:
-    if: always() && github.event.repository.private == false
-    needs: [lint, test]
+    if: always() && github.event.repository.visibility == 'public'
+    needs: [lint, test, shared-baseline]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
