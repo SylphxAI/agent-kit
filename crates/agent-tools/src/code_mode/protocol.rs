@@ -232,14 +232,31 @@ pub struct CodeExecRequest {
     pub max_tool_calls: Option<usize>,
 }
 
+/// Complete captured console records, including those already returned inline.
+/// The file is UTF-8 JSON Lines (one JSON string per console call). It lives
+/// on the runner's filesystem and the caller is responsible for removing it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsoleLogArtifact {
+    pub path: std::path::PathBuf,
+    pub entries: u64,
+    pub bytes: u64,
+}
+
 /// Structured outcome of executing a Code Mode snippet or batch.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CodeExecResult {
     pub ok: bool,
     #[serde(default)]
     pub result: Value,
+    /// Whole leading console records when `log_artifact` is present.
     #[serde(default)]
     pub logs: Vec<String>,
+    /// Set when not all captured records fit in `logs` (stdio runner only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_artifact: Option<ConsoleLogArtifact>,
+    /// Capture ended abnormally. Any returned logs are only the available prefix.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logs_incomplete: bool,
     pub duration_ms: u64,
     pub truncated: bool,
     pub original_bytes: usize,

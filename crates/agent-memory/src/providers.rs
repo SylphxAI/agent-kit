@@ -24,8 +24,6 @@ const RESERVED_TOKENS: usize = 16;
 const REMOTE_PIECE_TOKENS: usize = 512;
 /// Inputs per remote embedding request.
 const REMOTE_BATCH: usize = 64;
-/// Default character limit per passage sent to a remote reranker.
-pub const REMOTE_RERANK_CHARS: usize = 1000;
 /// Retry attempts for throttled or transiently failing upstream requests.
 const ATTEMPTS: u32 = 6;
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -53,7 +51,8 @@ pub struct Remote {
     /// Reranker: price per search for providers billing per search unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd_per_search: Option<f64>,
-    /// Reranker: max characters per passage ([`REMOTE_RERANK_CHARS`] when absent).
+    /// Reranker: optional character limit on each input (query or passage),
+    /// before prefixes. Inputs over the limit are rejected, never clipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passage_chars: Option<usize>,
     /// Optional instruction prefix prepended to queries.
@@ -612,23 +611,37 @@ impl RemoteModel {
         if passages.is_empty() {
             return Ok(Vec::new());
         }
-        self.pace(Duration::from_millis(100));
-        let cut = self.config.passage_chars.unwrap_or(REMOTE_RERANK_CHARS);
+        if let Some(limit) = self.config.passage_chars {
+            let check = |label: &str, input: &str| -> Result<(), Error> {
+                let chars = input.chars().count();
+                if chars > limit {
+                    return Err(format!("rerank {label} has {chars} characters, exceeding configured limit {limit}; no request sent").into());
+                }
+                Ok(())
+            };
+            check("query", query)?;
+            for (index, passage) in passages.iter().enumerate() {
+                check(&format!("passage at index {index}"), passage)?;
+            }
+        }
+        for key in ["query", "documents"] {
+            if self.config.body.contains_key(key) {
+                return Err(format!("rerank body must not override {key}; no request sent").into());
+            }
+        }
         let documents: Vec<String> = passages
             .iter()
-            .map(|p| {
-                let passage: String = p.chars().take(cut).collect();
-                format!("{}{passage}", self.config.passage_prefix)
-            })
+            .map(|p| format!("{}{p}", self.config.passage_prefix))
             .collect();
-        let query: String = query.chars().take(cut).collect();
+        let query = format!("{}{query}", self.config.query_prefix);
         let body = json!({
             "model": self.config.model,
-            "query": format!("{}{query}", self.config.query_prefix),
+            "query": query,
             "documents": documents,
             "top_n": documents.len(),
         });
         let body = self.body(body, &Map::new());
+        self.pace(Duration::from_millis(100));
         let answer = self.http.post(&self.endpoint, "/rerank", &body)?;
         let rows = answer
             .get("results")
@@ -1174,5 +1187,91 @@ pub(crate) mod tests {
         let query_sent = requests[1].2["input"][0].as_str().unwrap();
         let trimmed = query_sent.strip_prefix("Q: ").unwrap();
         assert_eq!(approximate_tokens(trimmed).len(), 100);
+    }
+
+    #[test]
+    fn remote_rerank_transmits_full_utf8_query_and_passages() {
+        let (url, seen) = serve(|path, _| {
+            assert_eq!(path, "/v1/rerank");
+            (
+                200,
+                json!({"results": [
+                    {"index": 2, "relevance_score": 0.75},
+                    {"index": 0, "relevance_score": 0.25},
+                    {"index": 1, "relevance_score": 0.5},
+                ]}),
+            )
+        });
+        let mut remote = RemoteModel::new(
+            Remote {
+                query_prefix: "Q: ".into(),
+                passage_prefix: "P: ".into(),
+                ..Remote::default()
+            },
+            Endpoint::new(format!("{url}/v1"), "example-token"),
+        );
+        let shared = "界🙂e\u{301}".repeat(1100);
+        let query = format!("{shared}\nquery\0tail");
+        let a = format!("{shared}\nfirst\0tail");
+        let b = format!("{shared}\nsecond\0tail");
+        assert_eq!(
+            remote.rerank(&query, &[&a, &b, "short"]).unwrap(),
+            [0.25, 0.5, 0.75]
+        );
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let (_, _, body) = &requests[0];
+        assert_eq!(
+            body["query"].as_str().unwrap().as_bytes(),
+            format!("Q: {query}").as_bytes()
+        );
+        let actual = body["documents"].as_array().unwrap();
+        for (actual, expected) in
+            actual
+                .iter()
+                .zip([format!("P: {a}"), format!("P: {b}"), "P: short".into()])
+        {
+            assert_eq!(actual.as_str().unwrap().as_bytes(), expected.as_bytes());
+        }
+        assert_eq!(actual.len(), 3);
+        assert_ne!(
+            actual[0], actual[1],
+            "same-prefix passages must not collapse"
+        );
+    }
+
+    #[test]
+    fn remote_rerank_rejects_over_limit_or_replaced_evidence_without_sending() {
+        let (url, seen) = serve(|_, _| (400, json!({"error": "unexpected request"})));
+        let mut remote = RemoteModel::new(
+            Remote {
+                passage_chars: Some(1000),
+                ..Remote::default()
+            },
+            Endpoint::new(format!("{url}/v1"), "example-token"),
+        );
+        let long = "界".repeat(1001);
+        let short = "🙂".repeat(1000);
+        let err = remote
+            .rerank(&short, &[&short, &long])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("passage at index 1 has 1001 characters, exceeding configured limit 1000"),
+            "{err}"
+        );
+        let err = remote.rerank(&long, &[&short]).unwrap_err().to_string();
+        assert!(
+            err.contains("query has 1001 characters, exceeding configured limit 1000"),
+            "{err}"
+        );
+        remote
+            .config
+            .body
+            .insert("documents".into(), json!(["replacement"]));
+        let err = remote.rerank(&short, &[&short]).unwrap_err().to_string();
+        assert!(err.contains("must not override documents"), "{err}");
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(remote.usage.requests, 0);
     }
 }

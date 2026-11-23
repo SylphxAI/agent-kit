@@ -316,6 +316,7 @@ pub struct Plan {
     pub rerankers: Vec<RerankerConfig>,
     #[serde(default = "default_max_usd")]
     pub max_usd: f64,
+    /// Optional input character limit for remote rerankers. Over-limit inputs fail without clipping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_chars: Option<usize>,
 }

@@ -15,6 +15,7 @@
 //!   namespaces (such as `coordination`) all implement [`NamespaceHandler`] and
 //!   register into [`ToolRegistry`].
 
+mod console;
 pub mod contract;
 pub mod protocol;
 pub mod registry;
@@ -23,8 +24,8 @@ pub mod sdk;
 
 pub use contract::{CodeLimits, TruncatedOutput, diagnose, truncate_json_output};
 pub use protocol::{
-    CodeExecRequest, CodeExecResult, JsonRpcRequest, JsonRpcResponse, RpcError, RpcId,
-    ToolCallRequest, ToolCallResponse,
+    CodeExecRequest, CodeExecResult, ConsoleLogArtifact, JsonRpcRequest, JsonRpcResponse, RpcError,
+    RpcId, ToolCallRequest, ToolCallResponse,
 };
 pub use registry::{
     FnNamespaceHandler, NamespaceHandler, NamespaceSpec, ToolDispatcher, ToolError, ToolRegistry,
