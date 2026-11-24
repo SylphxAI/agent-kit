@@ -250,15 +250,8 @@ pub(super) fn prepare(
     };
     let body = match auth {
         OutboundAuth::Telegram { bot_token } => {
-            let token = credential(bot_token)?;
-            if !token
-                .split_once(':')
-                .is_some_and(|(a, b)| digits(a) && id(b))
-            {
-                return Err(InvalidConfiguration);
-            }
             let (method, body) = telegram(msg)?;
-            request.path = format!("/bot{token}/{method}");
+            request.path = super::telegram::bot_api_path(bot_token, method)?;
             body
         }
         OutboundAuth::Slack { bot_token } => {

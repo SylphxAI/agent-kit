@@ -141,17 +141,21 @@ fn media(kind: MediaKind, source: MediaSource, v: &Value) -> Media {
 }
 
 fn telegram(req: WebhookRequest<'_>, token: &Secret, bot: &crate::telegram::BotIdentity) -> Events {
-    auth_eq(
-        req.header("X-Telegram-Bot-Api-Secret-Token"),
+    if !super::telegram::verify_webhook_secret(
         token.expose(),
-    )?;
+        req.header("X-Telegram-Bot-Api-Secret-Token"),
+    ) {
+        return Err(Unauthorized);
+    }
     let body = json_body(req)?;
     let event_id = body["update_id"].as_u64().ok_or(Malformed)?.to_string();
     let cb = body.get("callback_query");
     let msg = if let Some(cb) = cb {
         cb.get("message")
     } else {
-        body.get("message").or_else(|| body.get("channel_post"))
+        body.get("message")
+            .or_else(|| body.get("edited_message"))
+            .or_else(|| body.get("channel_post"))
     };
     let Some(msg) = msg else {
         return empty(Empty);
