@@ -1,5 +1,6 @@
-//! Channel primitives shared by agent hosts: inbound parsing, reply routing,
-//! and the outbound speech gate. No network, storage, or model calls.
+//! Authenticated channel connectors, reply routing, and an outbound speech gate.
+//! The crate never opens network connections; explicit delivery uses a host transport.
+//! See [connector] for the normalized protocol surface.
 //!
 //! - [`telegram`] turns a Bot API `Message` object into a
 //!   [`TelegramInboundMeta`](telegram::TelegramInboundMeta): the forum topic
@@ -58,6 +59,7 @@
 //! assert_eq!(payload["reply_parameters"]["message_id"], 10);
 //! ```
 
+pub mod connector;
 pub mod reply_target;
 pub mod speech_gate;
 pub mod telegram;
