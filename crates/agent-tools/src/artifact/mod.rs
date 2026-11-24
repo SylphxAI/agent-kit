@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
-pub use http::HttpArtifactBackend;
+pub use http::{HttpArtifactBackend, PreviewOriginPolicy};
 pub use local::LocalArtifactBackend;
 pub use tool::{ArtifactTool, artifact_tool_schema};
 

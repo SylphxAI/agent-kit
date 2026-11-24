@@ -39,10 +39,9 @@ back it up as a unit.
 
 ## HTTP backend contract
 
-A host can replace local storage with `HttpArtifactBackend::new(base_url,
-bearer_token, preview_origin)?`. The adapter sends `Authorization: Bearer …` to
-that base only, uses HTTPS (except literal HTTP loopback), and does not follow
-redirects. Requests and responses with bodies use JSON. Let `A` be
+The adapter sends the bearer credential only to the configured API. It uses
+HTTPS (except literal loopback HTTP) and does not follow redirects.
+Requests and responses with bodies use JSON. Let `A` be
 `<base>/v1/artifacts`, including any configured base path prefix.
 
 | Method and path | Request | Success |
@@ -66,9 +65,41 @@ Metadata fields: `artifact_id`, `title`, `kind`, `mime_type`, `version`,
 `diff` with `added_lines`, `removed_lines`, `truncated` and optional
 `unified_diff`. For binary kinds omit `diff`.
 
-The service issues private, expiring signed preview URLs. The client accepts
-links only from the explicitly configured HTTPS preview origin, on a different
-host from the API, and never fetches them. Link signing, expiry, revocation,
-renderer isolation and cookie scoping are service/host responsibilities. Treat
-preview URLs as credentials; do not log them or publish them to an unauthorized
-room.
+### Preview origin policies
+
+The service issues private, expiring signed preview URLs. The client checks
+links returned by the API but never fetches them. To configure the policy:
+
+- **Exact** matches a single HTTPS origin (scheme, host and port). Use
+  `HttpArtifactBackend::new(base_url, token, Some("https://example.test"))`,
+  or pass `PreviewOriginPolicy::Exact(origin)` to the policy-aware constructor.
+- **SingleSubdomainApex** matches exactly one label below a DNS apex. For
+  example, use:
+
+  ```rust,ignore
+  use agent_tools::artifact::{HttpArtifactBackend, PreviewOriginPolicy};
+
+  let backend = HttpArtifactBackend::new_with_preview_policy(
+      "https://offline.invalid",
+      token,
+      Some(PreviewOriginPolicy::SingleSubdomainApex {
+          apex_host: "sandbox.example.test".into(),
+          port: None, // Require HTTPS on port 443.
+      }),
+  )?;
+  ```
+
+  The allowed host has the form `<artifact-label>.sandbox.example.test`. The
+  label must be 1–63 lowercase ASCII letters, digits or hyphens, starting and
+  ending with a letter or digit. Punycode labels, the bare apex, deeper
+  subdomains and lookalike suffixes are not allowed. Set `port: Some(n)` to
+  require a different HTTPS port. The apex must be a lowercase ASCII DNS name
+  without a trailing dot and must not be the API host.
+
+Both policies reject userinfo and preview links on the API host, even on a
+separate port. Pass `None` to either constructor to reject all preview links.
+The caller must configure a dedicated preview site, and the service must
+assign a separate origin to each artifact when using per-artifact subdomains.
+The client does not verify that mapping, signatures, expiry, revocation or
+cookie scoping. Treat preview URLs as credentials: do not log them or publish
+them to an unauthorized room.
