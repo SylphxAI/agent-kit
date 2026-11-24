@@ -7,7 +7,7 @@ use super::BotCall;
 /// Telegram accepts unknown parameters, so the presence of chat_id is not a
 /// scope proof. Admit only methods documented to operate in that chat, and
 /// reject all other authority selectors. Global read-only exceptions are explicit.
-/// Reference: https://core.telegram.org/bots/api
+/// Reference: <https://core.telegram.org/bots/api>
 pub fn scoped_call(
     method: &str,
     params: Option<Value>,
