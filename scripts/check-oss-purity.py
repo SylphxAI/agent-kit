@@ -13,6 +13,8 @@ PUBLIC_HOSTS = {
     "api.e2b.dev",
     "api.jina.ai",
     "api.openai.com",
+    "api.telegram.org",
+    "core.telegram.org",
     "api.voyageai.com",
     "crates.io",
     "generativelanguage.googleapis.com",

@@ -6,6 +6,7 @@ mod inbound;
 mod outbound;
 mod sealed;
 pub mod signing;
+pub mod telegram;
 mod token_cache;
 pub use token_cache::{AccessTokenCache, TokenKey};
 
