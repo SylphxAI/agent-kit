@@ -11,6 +11,23 @@ use super::*;
 const MAX_GET_BODY: usize = MAX_ARTIFACT_BYTES * 6 + 16 * 1024;
 const MAX_METADATA_BODY: usize = 32 * 1024;
 
+/// Host-configured allowlist for signed preview links returned by the API.
+///
+/// Both policies require HTTPS on a host separate from the API. Neither policy
+/// fetches the link or validates its signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewOriginPolicy {
+    /// Match exactly one origin (scheme, host and port).
+    Exact(Origin),
+    /// Match exactly one lowercase DNS label below the configured apex.
+    SingleSubdomainApex {
+        /// A lowercase ASCII DNS name without a trailing dot.
+        apex_host: String,
+        /// The required HTTPS port. `None` means 443.
+        port: Option<u16>,
+    },
+}
+
 /// REST adapter for a trusted server implementing the artifact contract.
 ///
 /// The server must authorize every operation, enforce CAS and issue short-lived
@@ -22,7 +39,7 @@ const MAX_METADATA_BODY: usize = 32 * 1024;
 pub struct HttpArtifactBackend {
     collection: Url,
     bearer: String,
-    preview_origin: Option<Origin>,
+    preview_policy: Option<PreviewOriginPolicy>,
     agent: Agent,
 }
 
@@ -33,6 +50,29 @@ impl HttpArtifactBackend {
         base_url: &str,
         token: &str,
         preview_origin: Option<&str>,
+    ) -> Result<Self, ArtifactError> {
+        let preview_policy = preview_origin
+            .map(|input| {
+                let preview = parse_url(input).ok_or_else(|| invalid("invalid preview origin"))?;
+                if preview.path() != "/"
+                    || preview.query().is_some()
+                    || preview.fragment().is_some()
+                {
+                    return Err(invalid(
+                        "preview origin must not include a path, query or fragment",
+                    ));
+                }
+                Ok(PreviewOriginPolicy::Exact(preview.origin()))
+            })
+            .transpose()?;
+        Self::new_with_preview_policy(base_url, token, preview_policy)
+    }
+
+    /// Select an explicit preview policy. `None` refuses all preview links.
+    pub fn new_with_preview_policy(
+        base_url: &str,
+        token: &str,
+        preview_policy: Option<PreviewOriginPolicy>,
     ) -> Result<Self, ArtifactError> {
         let mut collection = parse_url(base_url).ok_or_else(|| invalid("invalid API base URL"))?;
         let is_loopback = match collection.host() {
@@ -48,21 +88,21 @@ impl HttpArtifactBackend {
                 "API base requires HTTPS or loopback HTTP, without query or fragment",
             ));
         }
-        let preview_origin = preview_origin
-            .map(|input| {
-                let preview = parse_url(input).ok_or_else(|| invalid("invalid preview origin"))?;
-                if preview.scheme() != "https"
-                    || preview.path() != "/"
-                    || preview.query().is_some()
-                    || preview.fragment().is_some()
-                    || preview.host_str().map(|host| host.trim_end_matches('.'))
-                        == collection.host_str().map(|host| host.trim_end_matches('.'))
-                {
-                    return Err(invalid("preview origin requires a separate HTTPS host"));
-                }
-                Ok(preview.origin())
-            })
-            .transpose()?;
+        match &preview_policy {
+            Some(PreviewOriginPolicy::Exact(Origin::Tuple(scheme, host, _)))
+                if scheme == "https" && !same_host(&host.to_string(), &collection) => {}
+            Some(PreviewOriginPolicy::SingleSubdomainApex { apex_host, .. })
+                if apex_host.len() <= 251 // Leave room for a dot and at least one character.
+                    && apex_host.split('.').all(is_dns_label)
+                    && matches!(Host::parse(apex_host), Ok(Host::Domain(host)) if host == *apex_host)
+                    && !same_host(apex_host, &collection) => {}
+            None => {}
+            _ => {
+                return Err(invalid(
+                    "preview policy requires a separate HTTPS host or DNS apex",
+                ));
+            }
+        }
         let credential = token.trim_end_matches('=');
         if credential.is_empty()
             || token.len() > 8192
@@ -87,7 +127,7 @@ impl HttpArtifactBackend {
         Ok(Self {
             collection,
             bearer: format!("Bearer {token}"),
-            preview_origin,
+            preview_policy,
             agent,
         })
     }
@@ -105,12 +145,53 @@ impl HttpArtifactBackend {
         meta.check().map_err(|_| ArtifactError::InvalidResponse)?;
         if let Some(link) = &meta.preview_url {
             let url = parse_url(link).ok_or(ArtifactError::InvalidResponse)?;
-            if url.scheme() != "https" || self.preview_origin.as_ref() != Some(&url.origin()) {
+            let host = url.host_str().ok_or(ArtifactError::InvalidResponse)?;
+            if url.scheme() != "https" || same_host(host, &self.collection) {
+                return Err(ArtifactError::InvalidResponse);
+            }
+            let allowed = match &self.preview_policy {
+                Some(PreviewOriginPolicy::Exact(origin)) => *origin == url.origin(),
+                Some(PreviewOriginPolicy::SingleSubdomainApex { apex_host, port }) => {
+                    // Validate the raw host spelling too: URL parsing normalizes case,
+                    // percent escapes and IDNA before exposing host_str().
+                    authority(link).is_some_and(|raw| {
+                        !raw.ends_with(':') && raw.split(':').next() == Some(host)
+                    }) && host.len() <= 253
+                        && url.port_or_known_default() == Some(port.unwrap_or(443))
+                        && host
+                            .strip_suffix(apex_host.as_str())
+                            .and_then(|prefix| prefix.strip_suffix('.'))
+                            .is_some_and(is_dns_label)
+                }
+                None => false,
+            };
+            if !allowed {
                 return Err(ArtifactError::InvalidResponse);
             }
         }
         Ok(())
     }
+}
+
+fn is_dns_label(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && !label.starts_with("xn--")
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn same_host(host: &str, other: &Url) -> bool {
+    other.host_str().is_some_and(|other_host| {
+        host.trim_end_matches('.')
+            .eq_ignore_ascii_case(other_host.trim_end_matches('.'))
+    })
+}
+
+fn authority(input: &str) -> Option<&str> {
+    input.split_once("://")?.1.split(['/', '?', '#']).next()
 }
 
 fn parse_url(input: &str) -> Option<Url> {
@@ -126,12 +207,7 @@ fn parse_url(input: &str) -> Option<Url> {
     if url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
-        || input
-            .split_once("://")?
-            .1
-            .split(['/', '?', '#'])
-            .next()?
-            .contains('@')
+        || authority(input)?.contains('@')
     {
         return None;
     }
@@ -328,5 +404,180 @@ impl ArtifactBackend for HttpArtifactBackend {
             false,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const API: &str = "https://localhost";
+    const APEX: &str = "example.test";
+    const TOKEN: &str = "test-token";
+
+    fn apex_policy(apex: &str, port: Option<u16>) -> Option<PreviewOriginPolicy> {
+        Some(PreviewOriginPolicy::SingleSubdomainApex {
+            apex_host: apex.into(),
+            port,
+        })
+    }
+
+    fn check_preview(backend: &HttpArtifactBackend, link: &str) -> Result<(), ArtifactError> {
+        backend.check_metadata(&ArtifactMetadata {
+            artifact_id: "item".into(),
+            title: "Preview".into(),
+            kind: ArtifactKind::Html,
+            mime_type: "text/html".into(),
+            version: 1,
+            sha256: "0".repeat(64),
+            byte_size: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            workspace_id: None,
+            room_id: None,
+            language: None,
+            preview_url: Some(link.into()),
+        })
+    }
+
+    fn preview_url(label: &str, port: &str) -> String {
+        format!("https://{label}.{APEX}{port}/view?sig=opaque")
+    }
+
+    fn assert_invalid_preview(backend: &HttpArtifactBackend, link: &str) {
+        assert!(
+            matches!(
+                check_preview(backend, link),
+                Err(ArtifactError::InvalidResponse)
+            ),
+            "accepted {link}"
+        );
+    }
+
+    #[test]
+    fn single_subdomain_accepts_strict_labels_and_matching_https_ports() {
+        let backend =
+            HttpArtifactBackend::new_with_preview_policy(API, TOKEN, apex_policy(APEX, None))
+                .unwrap();
+        for label in ["a", "0", "9-report-2", &"a".repeat(63)] {
+            check_preview(&backend, &preview_url(label, "")).unwrap();
+        }
+        check_preview(&backend, &preview_url("a", ":443")).unwrap();
+
+        let backend =
+            HttpArtifactBackend::new_with_preview_policy(API, TOKEN, apex_policy(APEX, Some(8443)))
+                .unwrap();
+        check_preview(&backend, &preview_url("a", ":8443")).unwrap();
+        assert_invalid_preview(&backend, &preview_url("a", ""));
+    }
+
+    #[test]
+    fn single_subdomain_rejects_out_of_scope_and_noncanonical_links() {
+        let backend =
+            HttpArtifactBackend::new_with_preview_policy(API, TOKEN, apex_policy(APEX, None))
+                .unwrap();
+        for (scheme, host_and_port) in [
+            ("https", APEX.into()),
+            ("https", format!("evil-{APEX}")),
+            ("https", format!("a.{APEX}.invalid")),
+            ("https", format!("a.{APEX}.")),
+            ("https", format!("/a.{APEX}")),
+            ("https", format!("a.{APEX}:")),
+            ("http", format!("a.{APEX}")),
+            ("https", format!("a.{APEX}:8443")),
+        ] {
+            assert_invalid_preview(&backend, &format!("{scheme}://{host_and_port}/view"));
+        }
+        for userinfo in ["", "user", "user:password"] {
+            assert_invalid_preview(&backend, &preview_url(&format!("{userinfo}@a"), ""));
+        }
+        for label in [
+            "",
+            "a.b",
+            "-a",
+            "a-",
+            "a_b",
+            "A",
+            "%61",
+            "\u{00e9}",
+            "xn--9ca",
+            &"a".repeat(64),
+        ] {
+            assert_invalid_preview(&backend, &preview_url(label, ""));
+        }
+    }
+
+    #[test]
+    fn single_subdomain_rejects_invalid_apex_and_the_api_host() {
+        let api_apex = format!("https://{APEX}./v1");
+        assert!(matches!(
+            HttpArtifactBackend::new_with_preview_policy(&api_apex, TOKEN, apex_policy(APEX, None)),
+            Err(ArtifactError::InvalidInput(_))
+        ));
+        for apex in [
+            "",
+            "TEST",
+            "https://example.test",
+            "127.0.0.1",
+            "localhost.",
+            "a..test",
+            "a_b",
+            "-a",
+            "xn--9ca",
+        ] {
+            assert!(
+                matches!(
+                    HttpArtifactBackend::new_with_preview_policy(
+                        API,
+                        TOKEN,
+                        apex_policy(apex, None)
+                    ),
+                    Err(ArtifactError::InvalidInput(_))
+                ),
+                "accepted apex {apex}"
+            );
+        }
+        // An API host that is itself a child of the apex stays excluded on any port.
+        let api_child = format!("https://{host}./v1", host = format_args!("api.{APEX}"));
+        let backend = HttpArtifactBackend::new_with_preview_policy(
+            &api_child,
+            TOKEN,
+            apex_policy(APEX, Some(8443)),
+        )
+        .unwrap();
+        assert_invalid_preview(&backend, &preview_url("api", ":8443"));
+        check_preview(&backend, &preview_url("item", ":8443")).unwrap();
+    }
+
+    #[test]
+    fn legacy_constructor_still_requires_an_exact_https_origin() {
+        let backend =
+            HttpArtifactBackend::new(API, TOKEN, Some("https://example.test:8443")).unwrap();
+        let valid = "https://example.test:8443/view?sig=opaque";
+        check_preview(&backend, valid).unwrap();
+        // Exact remains an origin comparison, not a raw hostname comparison.
+        check_preview(
+            &backend,
+            &format!("https://{}:8443/view", APEX.to_uppercase()),
+        )
+        .unwrap();
+        for link in [
+            "http://example.test:8443/preview",
+            "https://example.test/preview",
+            "https://sandbox.example.test:8443/preview",
+        ] {
+            assert!(
+                matches!(
+                    check_preview(&backend, link),
+                    Err(ArtifactError::InvalidResponse)
+                ),
+                "accepted {link}"
+            );
+        }
+        let unconfigured = HttpArtifactBackend::new(API, TOKEN, None).unwrap();
+        assert!(matches!(
+            check_preview(&unconfigured, valid),
+            Err(ArtifactError::InvalidResponse)
+        ));
     }
 }
