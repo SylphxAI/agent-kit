@@ -19,6 +19,7 @@ use std::{
 };
 
 use crate::{
+    artifact::{ArtifactBackend, ArtifactError, ArtifactTool},
     code_mode::protocol::{RpcError, ToolCallRequest, ToolCallResponse},
     ops::{
         self, EditParams, ExecParams, GlobParams, GrepParams, ListParams, MultiEditParams,
@@ -41,6 +42,8 @@ pub enum ToolError {
     InvalidParams(String),
     #[error("{0}")]
     Execution(String),
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
 }
 
 impl From<ToolError> for RpcError {
@@ -49,6 +52,28 @@ impl From<ToolError> for RpcError {
             ToolError::UnknownMethod { .. } => RpcError::method_not_found(err.to_string()),
             ToolError::InvalidParams(msg) => RpcError::invalid_params(msg),
             ToolError::Execution(msg) => RpcError::execution(msg),
+            ToolError::Artifact(err) => {
+                let (kind, status) = match err {
+                    ArtifactError::InvalidInput(_) => ("InvalidInput", 400),
+                    ArtifactError::SizeLimit => ("SizeLimit", 413),
+                    ArtifactError::NotFound => ("NotFound", 404),
+                    ArtifactError::VersionConflict => ("VersionConflict", 409),
+                    ArtifactError::Storage => ("Storage", 500),
+                    ArtifactError::HttpStatus(status) => ("HttpStatus", status),
+                    ArtifactError::Transport => ("Transport", 502),
+                    ArtifactError::InvalidResponse => ("InvalidResponse", 502),
+                };
+                let mut rpc = if matches!(
+                    err,
+                    ArtifactError::InvalidInput(_) | ArtifactError::SizeLimit
+                ) {
+                    RpcError::invalid_params(err.to_string())
+                } else {
+                    RpcError::execution(err.to_string())
+                };
+                rpc.data = Some(serde_json::json!({"kind": kind, "status": status}));
+                rpc
+            }
         }
     }
 }
@@ -345,6 +370,11 @@ impl ToolRegistry {
     /// Convenience helper to mount the standard `workspace` namespace.
     pub fn with_workspace(self, backend: Arc<dyn WorkspaceBackend>) -> Self {
         self.with_namespace(Arc::new(WorkspaceNamespaceHandler::new(backend)))
+    }
+
+    /// Mount versioned artifacts with an explicitly selected backend.
+    pub fn with_artifact(self, backend: Arc<dyn ArtifactBackend>) -> Self {
+        self.with_namespace(Arc::new(ArtifactTool::new(backend)))
     }
 
     /// Convenience helper to mount the SSRF-safe `web` namespace.
