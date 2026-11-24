@@ -36,6 +36,7 @@
 //! # }
 //! ```
 
+pub mod artifact;
 pub mod code_mode;
 pub mod ops;
 pub mod skills;
