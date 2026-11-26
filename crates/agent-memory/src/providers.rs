@@ -8,15 +8,18 @@
 use crate::{
     embed::{Chunk, MAX_PIECES, chunk},
     model::ModelPin,
+    remote::{deny_data_collection, embedding_request, rerank_request},
     runtime::{Encoder, Error},
     text::{is_cjk, project},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+pub use crate::Stamp;
 
 /// Tokens reserved in each piece for special tokens and passage prefix.
 const RESERVED_TOKENS: usize = 16;
@@ -173,28 +176,6 @@ impl ProviderConfig {
     pub fn load_required(path: &Path) -> Result<Self, Error> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?)
-    }
-}
-
-/// Vector space identity: equal stamps produce comparable vectors.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Stamp {
-    pub provider: String,
-    pub model: String,
-    pub dimensions: usize,
-    /// Preprocessing descriptor: projection, piece budget, token counter, and passage prefix.
-    pub preprocessing: String,
-}
-
-impl Stamp {
-    pub fn key(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
-    /// Short SHA-256 prefix identifying this space's dense index file.
-    pub fn digest(&self) -> String {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(self.key().as_bytes()))[..16].to_owned()
     }
 }
 
@@ -406,25 +387,6 @@ fn via_openrouter(config: &Remote, endpoint: &Endpoint) -> bool {
             .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
 }
 
-fn deny_data_collection(body: &mut Value) {
-    let Value::Object(object) = body else {
-        return;
-    };
-    let provider = object
-        .entry("provider")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !provider.is_object() {
-        *provider = Value::Object(Map::new());
-    }
-    if let Value::Object(provider) = provider {
-        provider.insert("data_collection".into(), json!("deny"));
-    }
-}
-
-fn reported_cost(answer: &Value) -> Option<f64> {
-    answer.pointer("/usage/cost").and_then(Value::as_f64)
-}
-
 fn normalized(mut v: Vec<f32>) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -527,7 +489,8 @@ impl RemoteModel {
     fn account(&mut self, answer: &Value, tokens: u64, searches: u64) {
         self.usage.requests += 1;
         self.usage.tokens += tokens;
-        match reported_cost(answer) {
+        // Keep historical eval cost extraction and estimates here, not in the wire codec.
+        match answer.pointer("/usage/cost").and_then(Value::as_f64) {
             Some(usd) => self.usage.usd += usd,
             None => match (
                 self.config.usd_per_search,
@@ -548,16 +511,10 @@ impl RemoteModel {
         let mut out = Vec::with_capacity(texts.len());
         for batch in texts.chunks(REMOTE_BATCH) {
             self.pace(Duration::from_millis(200));
-            let mut body = json!({
-                "model": self.config.model,
-                "input": batch,
-                "encoding_format": "float",
-            });
-            if let Some(d) = self.config.dimensions {
-                body["dimensions"] = json!(d);
-            }
+            let body = embedding_request(&self.config.model, batch, self.config.dimensions, false);
             let body = self.body(body, extra);
             let answer = self.http.post(&self.endpoint, "/embeddings", &body)?;
+            // The historical eval protocol allows implicit indices and normalizes vectors.
             let mut rows: Vec<(usize, Vec<f32>)> = answer
                 .get("data")
                 .and_then(Value::as_array)
@@ -634,15 +591,11 @@ impl RemoteModel {
             .map(|p| format!("{}{p}", self.config.passage_prefix))
             .collect();
         let query = format!("{}{query}", self.config.query_prefix);
-        let body = json!({
-            "model": self.config.model,
-            "query": query,
-            "documents": documents,
-            "top_n": documents.len(),
-        });
+        let body = rerank_request(&self.config.model, &query, &documents, false);
         let body = self.body(body, &Map::new());
         self.pace(Duration::from_millis(100));
         let answer = self.http.post(&self.endpoint, "/rerank", &body)?;
+        // Historical eval gives omitted passages a floor score (e.g. with top_n overrides).
         let rows = answer
             .get("results")
             .or_else(|| answer.get("data"))
@@ -963,6 +916,7 @@ impl Reranker {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -1187,6 +1141,45 @@ pub(crate) mod tests {
         let query_sent = requests[1].2["input"][0].as_str().unwrap();
         let trimmed = query_sent.strip_prefix("Q: ").unwrap();
         assert_eq!(approximate_tokens(trimmed).len(), 100);
+    }
+
+    #[test]
+    fn historical_eval_keeps_implicit_embedding_indices_and_partial_rerank() {
+        let (url, seen) = serve(|path, body| match path {
+            "/v1/embeddings" => (200, json!({"data": [{"embedding": [3, 4]}]})),
+            "/v1/rerank" => {
+                assert_eq!(body["top_n"], json!(1));
+                (
+                    200,
+                    json!({"results": [{"index": 1, "relevance_score": 0.75}]}),
+                )
+            }
+            _ => (400, json!({})),
+        });
+        let config = Remote {
+            profile: "openrouter/default".into(),
+            body: Map::from_iter([
+                ("top_n".into(), json!(1)),
+                (
+                    "provider".into(),
+                    json!({"data_collection": "allow", "order": ["example"]}),
+                ),
+            ]),
+            ..Remote::default()
+        };
+        let mut model = RemoteModel::new(config, Endpoint::new(format!("{url}/v1"), "fixture"));
+        let vectors = model.embed(&["word".into()], &Map::new()).unwrap();
+        assert_eq!(vectors, [vec![0.6, 0.8]]);
+        assert_eq!(model.usage.tokens, 1);
+        let scores = model.rerank("find", &["one", "two"]).unwrap();
+        assert_eq!(scores, [f32::MIN, 0.75]);
+        assert_eq!(model.usage.tokens, 4);
+        for (_, _, body) in seen.lock().unwrap().iter() {
+            assert_eq!(
+                body["provider"],
+                json!({"data_collection": "deny", "order": ["example"]})
+            );
+        }
     }
 
     #[test]
