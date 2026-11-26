@@ -2,9 +2,8 @@ name: ci
 
 # Format, clippy, docs, and unit/integration tests for the workspace.
 #
-# Jobs that execute this repository's code use standard hosted runners only
-# when the caller is public. The shared baseline inspects Git objects without
-# executing caller code.
+# Only affirmatively public events use hosted runners. The shared baseline
+# inspects Git objects without executing caller code.
 #
 # `ci-ok` is the one required check; it runs no repository code.
 
@@ -45,14 +44,18 @@ jobs:
       migrations: ${{ needs.changes.outputs.migrations }}
 
   lint:
-    if: github.event.repository.visibility == 'public'
-    runs-on: ubuntu-latest
+    if: >-
+      github.event.repository.visibility == 'public' ||
+      ((github.event.repository.visibility == 'private' || github.event.repository.visibility == 'internal') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'sylphx-linux-standard' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - name: Verify approved references and tracked text
+        if: github.event.repository.visibility == 'public'
         run: python3 scripts/check-oss-purity.py
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
@@ -70,8 +73,11 @@ jobs:
           cargo doc --workspace --no-deps --all-features --locked
 
   test:
-    if: github.event.repository.visibility == 'public'
-    runs-on: ubuntu-latest
+    if: >-
+      github.event.repository.visibility == 'public' ||
+      ((github.event.repository.visibility == 'private' || github.event.repository.visibility == 'internal') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'sylphx-linux-standard' }}
     timeout-minutes: 45
     services:
       postgres:
@@ -109,16 +115,23 @@ jobs:
           cargo check -p agent-memory --no-default-features --features postgres --locked
 
   ci-ok:
-    if: always() && github.event.repository.visibility == 'public'
-    needs: [lint, test, shared-baseline]
-    runs-on: ubuntu-latest
+    if: always() && !cancelled()
+    needs: [changes, lint, test, shared-baseline]
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'sylphx-linux-control' }}
     timeout-minutes: 5
     steps:
       - name: All required jobs passed
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+          TEST: ${{ needs['test'].result }}
+          BASELINE: ${{ needs.shared-baseline.result }}
+          BASELINE_REQUIRED: ${{ github.event.repository.visibility == 'public' || needs.changes.outputs.migrations != 'false' }}
         run: |
-          echo "results: $RESULTS"
-          for r in $RESULTS; do
-            [ "$r" = success ] || { echo "a required job did not succeed"; exit 1; }
-          done
+          echo "results: changes=$CHANGES lint=$LINT test=$TEST baseline=$BASELINE (required=$BASELINE_REQUIRED)"
+          if [ "$CHANGES" != success ] || [ "$LINT" != success ] || [ "$TEST" != success ]; then
+            echo "a required job did not succeed"; exit 1
+          fi
+          if [ "$BASELINE" != success ] && { [ "$BASELINE" != skipped ] || [ "$BASELINE_REQUIRED" != false ]; }; then
+            echo "the shared baseline did not succeed"; exit 1
+          fi
