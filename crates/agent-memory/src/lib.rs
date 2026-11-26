@@ -38,6 +38,8 @@ pub mod lexical;
 pub mod notes;
 pub mod protocol;
 pub mod raw;
+pub mod remote;
+mod stamp;
 pub mod store;
 pub mod text;
 pub mod tokenize;
@@ -68,6 +70,7 @@ pub use lexical::{
     score_lexical_documents_with_config,
 };
 pub use raw::{MAX_RAW_RANGE_BYTES, RawCoordinate, RawSegment, read_raw, read_raw_range};
+pub use stamp::Stamp;
 pub use store::{
     EmbeddingChunk, MemorySearchRequest, MemoryStore, RawCitation, RawRecordInput, SearchHit,
     StoreError, StoreStats,
